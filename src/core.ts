@@ -2,11 +2,11 @@
  * Opérations spm. Aucune n'écrit dans le terminal : elles renvoient des données et signalent
  * leur progression via un Reporter, pour être appelées aussi bien par la CLI que par un serveur MCP.
  */
-import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { caddyDomains } from "./caddy";
-import { detect, GENERATED_DOCKERIGNORE, type Detected } from "./detect";
+import { detect, GENERATED_DOCKERIGNORE, SECRETS_DOCKERIGNORE, type Detected } from "./detect";
 import {
   allContainers, compose, composeOk, containerName, docker, dockerOk, imageName, inspectState, toStatus,
   type ContainerInfo,
@@ -46,6 +46,7 @@ export function parseEnv(pairs: string[]): Record<string, string> {
     const i = pair.indexOf("=");
     const key = i > 0 ? pair.slice(0, i) : "";
     if (!ENV_KEY.test(key)) throw new SpmError(`variable invalide : "${pair}" (attendu : CLE=valeur)`);
+    if (key === "PORT") throw new SpmError("PORT est fixé par spm : utilise --internal-port pour changer le port de l'app");
     env[key] = pair.slice(i + 1);
   }
   return env;
@@ -99,6 +100,9 @@ function getContainerProject(name: string): ContainerProject {
   return p;
 }
 
+/** "8002" ou "127.0.0.1:8001" → 8002 */
+const portNumber = (p: string) => Number(p.split(":").pop());
+
 async function portIsFree(port: number): Promise<boolean> {
   try {
     const s = Bun.listen({ hostname: "0.0.0.0", port, socket: { data() {} } });
@@ -109,9 +113,19 @@ async function portIsFree(port: number): Promise<boolean> {
   }
 }
 
+/**
+ * Ports réservés par les projets spm (même arrêtés) et publiés par n'importe quel conteneur :
+ * un bind de test ne les voit pas toujours (userland-proxy désactivé, conteneur arrêté).
+ */
+async function usedPorts(): Promise<Set<number>> {
+  const reserved = Object.values(loadRegistry().projects).flatMap((p) => (isCompose(p) ? [] : [p.port]));
+  const published = (await allContainers()).flatMap((c) => c.ports.map(portNumber));
+  return new Set([...reserved, ...published]);
+}
+
 async function allocatePort(): Promise<number> {
   const { port_min, port_max } = loadConfig();
-  const used = new Set(Object.values(loadRegistry().projects).flatMap((p) => (isCompose(p) ? [] : [p.port])));
+  const used = await usedPorts();
   for (let port = port_min; port <= port_max; port++) {
     if (!used.has(port) && (await portIsFree(port))) return port;
   }
@@ -123,15 +137,25 @@ async function allocatePort(): Promise<number> {
 async function buildImage(name: string, path: string, r: Reporter): Promise<Detected> {
   if (!existsSync(path)) throw new SpmError(`le dossier du projet n'existe plus : ${path}`);
   const detected = detect(path);
+  const ownIgnore = existsSync(join(path, ".dockerignore")) || existsSync(join(path, "Dockerfile.dockerignore"));
   let dockerfile = join(path, "Dockerfile");
-  if (detected.dockerfile) {
+  // BuildKit lit <Dockerfile>.dockerignore à côté du Dockerfile : on écrit les deux dans ~/.spm/builds,
+  // le contexte reste le dossier du projet, qui n'est jamais modifié.
+  const writeBuild = (content: string, ignore: string) => {
     const dir = join(BUILDS_DIR, name);
     mkdirSync(dir, { recursive: true });
     dockerfile = join(dir, "Dockerfile");
-    writeFileSync(dockerfile, detected.dockerfile);
-    writeFileSync(`${dockerfile}.dockerignore`, GENERATED_DOCKERIGNORE);
+    writeFileSync(dockerfile, content);
+    writeFileSync(`${dockerfile}.dockerignore`, ignore);
+  };
+  if (detected.dockerfile) {
+    writeBuild(detected.dockerfile, GENERATED_DOCKERIGNORE);
     r.step(`projet ${detected.kind} détecté, Dockerfile généré dans ${dockerfile}`);
+  } else if (!ownIgnore) {
+    writeBuild(readFileSync(dockerfile, "utf8"), SECRETS_DOCKERIGNORE);
+    r.step("Dockerfile du projet utilisé (sans .dockerignore : .env exclu de l'image)");
   } else {
+    rmSync(join(BUILDS_DIR, name), { recursive: true, force: true });
     r.step("Dockerfile du projet utilisé");
   }
   r.step(`docker build -t ${imageName(name)}`);
@@ -153,10 +177,11 @@ async function createContainer(p: ContainerProject, start: boolean): Promise<str
       "--label", `spm.project=${p.name}`,
       "--restart", "unless-stopped",
       "-p", `${p.bind}:${p.port}:${p.internal_port}`,
-      "-e", `PORT=${p.internal_port}`,
       ...(existsSync(envFile) ? ["--env-file", envFile] : []),
-      // Après --env-file, donc prioritaire. Valeurs passées par l'environnement, pas en argument.
+      // -e prime sur --env-file. Valeurs passées par l'environnement, pas en argument.
       ...Object.keys(p.env).flatMap((k) => ["-e", k]),
+      // En dernier : doit correspondre au port mappé, quoi que disent .env ou un ancien registre.
+      "-e", `PORT=${p.internal_port}`,
       ...p.volumes.flatMap((v) => [
         "-v", `${isNamedVolume(v) ? dockerVolumeName(p.name, v) : v.source}:${v.target}${v.readonly ? ":ro" : ""}`,
       ]),
@@ -266,7 +291,7 @@ export async function addProject(opts: AddOptions, r: Reporter): Promise<{ proje
     port = parsePort(opts.port);
     const owner = Object.values(reg.projects).find((p) => !isCompose(p) && p.port === port);
     if (owner) throw new SpmError(`le port ${port} est déjà utilisé par "${owner.name}"`);
-    if (!(await portIsFree(port))) throw new SpmError(`le port ${port} est déjà occupé sur la machine`);
+    if ((await usedPorts()).has(port) || !(await portIsFree(port))) throw new SpmError(`le port ${port} est déjà occupé sur la machine`);
   } else {
     port = await allocatePort();
   }
@@ -380,9 +405,17 @@ export async function redeploy(name: string, r: Reporter): Promise<{ start: Star
   }
 
   r.step("remplacement du conteneur");
-  updateProject(name, { kind: detected.kind });
-  await createContainer(p, true);
-  const start = await checkStarted(name, 0);
+  let start: StartResult;
+  try {
+    await createContainer(p, true);
+    start = await checkStarted(name, 0);
+  } catch (e) {
+    // Ex. : port pris entre-temps. L'ancien conteneur est déjà supprimé : on passe au retour arrière.
+    if (!(e instanceof SpmError)) throw e;
+    updateProject(name, { status: "failed" });
+    start = { ok: false, logs: e.message };
+  }
+  if (start.ok) updateProject(name, { kind: detected.kind });
   if (start.ok || !hadImage) {
     if (hadImage) await docker(["rmi", previous]);
     return { start, rolledBack: false };
@@ -463,8 +496,6 @@ export interface ProjectRow {
   domains: string[];
   path: string;
 }
-
-const portNumber = (p: string) => Number(p.split(":").pop());
 
 function domainsFor(ports: string[], caddy: Map<number, string[]>): string[] {
   return [...new Set(ports.flatMap((p) => caddy.get(portNumber(p)) ?? []))];

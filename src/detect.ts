@@ -85,7 +85,8 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PORT=8000
 ${pipInstall}${extra}COPY . .
 EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# Forme shell pour lire $PORT (--internal-port) ; exec garde uvicorn en PID 1 pour les signaux.
+CMD exec uvicorn main:app --host 0.0.0.0 --port "\${PORT:-8000}" --proxy-headers --forwarded-allow-ips "*"
 `,
     };
   }
@@ -108,6 +109,14 @@ CMD ["python", "${entry}"]
 
   throw new SpmError(`type de projet non reconnu dans ${dir} (attendu : Dockerfile, package.json, requirements.txt ou main.py FastAPI)`);
 }
+
+/**
+ * Exclusions pour un Dockerfile fourni par le projet mais sans .dockerignore :
+ * juste de quoi ne jamais copier les secrets dans l'image.
+ */
+export const SECRETS_DOCKERIGNORE = `.env
+.env.*
+`;
 
 /** Exclusions de contexte pour les Dockerfiles générés (lu par BuildKit à côté du Dockerfile). */
 export const GENERATED_DOCKERIGNORE = `.git

@@ -88,6 +88,7 @@ export function loadRegistry(): Registry {
     if (isCompose(p)) continue;
     // Registres créés par une version antérieure
     p.env ??= {};
+    delete p.env.PORT; // fixé par spm depuis 0.3.0
     p.volumes ??= [];
     p.bind ??= "0.0.0.0";
   }
