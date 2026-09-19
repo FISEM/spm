@@ -7,7 +7,8 @@
     "dev": "bun src/spm.ts",
     "typecheck": "tsc --noEmit",
     "build": "bun build --compile --minify src/spm.ts --outfile dist/spm",
-    "release": "bun build --compile --minify --target=bun-linux-x64 src/spm.ts --outfile dist/spm-linux-x64 && bun build --compile --minify --target=bun-linux-arm64 src/spm.ts --outfile dist/spm-linux-arm64"
+    "release": "bun build --compile --minify --target=bun-linux-x64 src/spm.ts --outfile dist/spm-linux-x64 && bun build --compile --minify --target=bun-linux-arm64 src/spm.ts --outfile dist/spm-linux-arm64 && cd dist && sha256sum spm-linux-x64 spm-linux-arm64 > SHA256SUMS",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "latest",

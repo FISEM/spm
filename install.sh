@@ -21,13 +21,20 @@ case "$(uname -m)" in
   *) die "architecture non supportée : $(uname -m)" ;;
 esac
 
+command -v sha256sum >/dev/null || die "sha256sum manquant (paquet coreutils)"
 command -v docker >/dev/null || die "Docker n'est pas installé : https://docs.docker.com/engine/install/"
 docker info >/dev/null 2>&1 || die "impossible de parler à Docker (ajoute-toi au groupe docker : sudo usermod -aG docker $(id -un), puis reconnecte-toi)"
 
 say "téléchargement de spm-linux-$ARCH"
 TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
+trap 'rm -f "$TMP" "$TMP.sums"' EXIT
 curl -fsSL "$BASE_URL/spm-linux-$ARCH" -o "$TMP" || die "téléchargement impossible depuis $BASE_URL"
+
+# Détecte un téléchargement tronqué ou altéré en route (pas un serveur compromis : les sommes viennent du même endroit).
+curl -fsSL "$BASE_URL/SHA256SUMS" -o "$TMP.sums" || die "SHA256SUMS introuvable sur $BASE_URL"
+EXPECTED="$(awk -v f="spm-linux-$ARCH" '$2 == f || $2 == "*" f { print $1 }' "$TMP.sums")"
+[ -n "$EXPECTED" ] || die "spm-linux-$ARCH absent de SHA256SUMS"
+[ "$(sha256sum "$TMP" | cut -d' ' -f1)" = "$EXPECTED" ] || die "empreinte SHA-256 invalide : binaire corrompu, installation annulée"
 chmod +x "$TMP"
 "$TMP" --version >/dev/null || die "le binaire téléchargé ne s'exécute pas"
 $SUDO install -m 0755 "$TMP" "$BIN"
