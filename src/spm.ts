@@ -3,11 +3,11 @@ import { parseArgs } from "node:util";
 import pkg from "../package.json";
 import {
   addProject, describeVolume, envList, envSet, envUnset, importProject, lifecycle, listProjects, parseEnv, parsePort,
-  projectStatus, redeploy, removeProject, unmanagedContainers, volumeAdd, volumeList, volumeRemove,
+  projectStatus, redeploy, removeProject, setOptions, unmanagedContainers, volumeAdd, volumeList, volumeRemove,
   type Reporter, type StartResult,
 } from "./core";
 import { compose, containerName, docker } from "./docker";
-import { getProject, isCompose, loadRegistry, SpmError } from "./registry";
+import { acquireLock, getProject, isCompose, loadRegistry, SpmError } from "./registry";
 
 const VERSION = pkg.version;
 
@@ -24,6 +24,9 @@ Projets :
                                     supprime les conteneurs) ; --purge supprime aussi les volumes
   spm logs <nom> [-f] [-n <lignes>]
   spm status <nom>
+  spm set <nom> memory=512m health=/health
+                                    limite mémoire, chemin HTTP vérifié au démarrage ;
+                                    une valeur vide retire le réglage (memory=)
 
 Variables d'environnement :
   spm env <nom>                     liste
@@ -43,6 +46,8 @@ Options de add :
   -e, --env CLE=valeur     variable d'environnement (répétable)
   -v, --volume src:cible   volume (répétable) ; src = nom court (volume Docker)
                            ou chemin (/, ./ ou ~ ; relatif au dossier du projet)
+  --memory <taille>        limite mémoire du conteneur (ex. 512m, 1g)
+  --health <chemin>        déploiement réussi seulement si ce chemin répond en HTTP (< 400)
 `;
 
 const cli: Reporter = { step: (m) => console.log(`→ ${m}`), stream: true };
@@ -74,6 +79,8 @@ async function add(args: string[]) {
       local: { type: "boolean" },
       env: { type: "string", short: "e", multiple: true },
       volume: { type: "string", short: "v", multiple: true },
+      memory: { type: "string" },
+      health: { type: "string" },
     },
   });
   if (!positionals[0]) throw new SpmError("usage : spm add <path> [--port <port>]");
@@ -87,6 +94,8 @@ async function add(args: string[]) {
       local: values.local,
       env: parseEnv(values.env ?? []),
       volumes: values.volume,
+      memory: values.memory,
+      health: values.health,
     },
     cli,
   );
@@ -176,6 +185,8 @@ async function status(name: string) {
   } else {
     console.log(`${p.name}  ${p.bind}:${p.port} → ${p.internal_port}  (${p.kind}, ${status})`);
     console.log(`chemin    : ${p.path}`);
+    if (p.memory) console.log(`mémoire   : ${p.memory} max`);
+    if (p.health) console.log(`santé     : GET ${p.health}`);
     if (Object.keys(p.env).length) console.log(`env       : ${Object.keys(p.env).join(", ")}`);
     for (const v of p.volumes) console.log(`volume    : ${describeVolume(p.name, v)}`);
   }
@@ -222,7 +233,20 @@ async function volume(args: string[]) {
   throw new SpmError("usage : spm volume <nom> | spm volume add <nom> <source>:<cible>[:ro] | spm volume rm <nom> <cible>");
 }
 
+async function set(args: string[]) {
+  const [name, ...pairs] = args;
+  if (!name) throw new SpmError("usage : spm set <nom> memory=512m health=/health");
+  report(name, await setOptions(name, pairs, cli), `réglages mis à jour pour ${name}`);
+}
+
 // ---------------------------------------------------------------- main
+
+/** Commandes qui modifient l'état : une seule à la fois (les listes et les logs restent libres). */
+function mutates(cmd: string | undefined, rest: string[]): boolean {
+  if (cmd === "env") return rest[0] === "set" || rest[0] === "unset";
+  if (cmd === "volume" || cmd === "volumes") return ["add", "rm", "remove"].includes(rest[0] ?? "");
+  return ["add", "import", "redeploy", "deploy", "start", "stop", "restart", "remove", "rm", "set"].includes(cmd ?? "");
+}
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
@@ -230,6 +254,8 @@ async function main() {
     if (!rest[0]) throw new SpmError(`usage : spm ${cmd} <nom>`);
     return rest[0];
   };
+  // Sans les CLE=valeur : le verrou affiche la commande en cours, pas les secrets qu'elle contient.
+  if (mutates(cmd, rest)) acquireLock([cmd, ...rest.slice(0, 2)].filter((a) => !a!.includes("=")).join(" "));
 
   switch (cmd) {
     case "add": return add(rest);
@@ -242,6 +268,7 @@ async function main() {
     case "status": return status(needName());
     case "env": return env(rest);
     case "volume": case "volumes": return volume(rest);
+    case "set": return set(rest);
     case "-v": case "--version": case "version": return console.log(VERSION);
     case undefined: case "-h": case "--help": case "help": return console.log(HELP);
     default: throw new SpmError(`commande inconnue : ${cmd}\n\n${HELP}`);

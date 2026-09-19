@@ -8,7 +8,7 @@ import { basename, join, resolve } from "node:path";
 import { caddyDomains } from "./caddy";
 import { detect, GENERATED_DOCKERIGNORE, SECRETS_DOCKERIGNORE, type Detected } from "./detect";
 import {
-  allContainers, compose, composeOk, containerName, docker, dockerOk, imageName, inspectState, toStatus,
+  allContainers, compose, composeOk, containerName, docker, dockerOk, imageName, inspectState, loggingDriver, toStatus,
   type ContainerInfo,
 } from "./docker";
 import {
@@ -36,6 +36,21 @@ export function parsePort(value: string | number): number {
   const n = Number(value);
   if (!Number.isInteger(n) || n < 1 || n > 65535) throw new SpmError(`port invalide : ${value}`);
   return n;
+}
+
+const UNITS: Record<string, number> = { b: 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 };
+
+/** Limite mémoire au format Docker : 512m, 1g… (6m minimum, imposé par Docker). */
+export function parseMemory(value: string): string {
+  const m = value.trim().toLowerCase().match(/^(\d+)([bkmg]?)$/);
+  if (!m) throw new SpmError(`mémoire invalide : ${value} (ex. 512m, 1g)`);
+  if (Number(m[1]) * UNITS[m[2] || "b"]! < 6 * UNITS.m!) throw new SpmError(`mémoire trop faible : ${value} (6m minimum)`);
+  return `${m[1]}${m[2]}`;
+}
+
+export function parseHealth(value: string): string {
+  if (!/^\/\S*$/.test(value)) throw new SpmError(`chemin de vérification invalide : ${value} (ex. /health)`);
+  return value;
 }
 
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -159,9 +174,13 @@ async function buildImage(name: string, path: string, r: Reporter): Promise<Dete
     r.step("Dockerfile du projet utilisé");
   }
   r.step(`docker build -t ${imageName(name)}`);
-  await dockerOk(["build", "-t", imageName(name), "-f", dockerfile, path], r.stream);
+  // Label : permet de retrouver les anciennes images de ce projet pour les nettoyer.
+  await dockerOk(["build", "-t", imageName(name), "--label", `spm.project=${name}`, "-f", dockerfile, path], r.stream);
   return detected;
 }
+
+/** Supprime les anciennes images du projet, remplacées par un build plus récent (sinon le disque se remplit). */
+const pruneImages = (name: string) => docker(["image", "prune", "-f", "--filter", `label=spm.project=${name}`]);
 
 /** (Re)crée le conteneur depuis la config du registre. `start` : run, sinon create (démarré plus tard). */
 async function createContainer(p: ContainerProject, start: boolean): Promise<string> {
@@ -170,12 +189,20 @@ async function createContainer(p: ContainerProject, start: boolean): Promise<str
   for (const v of p.volumes) if (!isNamedVolume(v)) mkdirSync(v.source, { recursive: true });
 
   const envFile = join(p.path, ".env");
+  const { log_max_size, log_max_files } = loadConfig();
+  // json-file (défaut de Docker) ne fait aucune rotation : sans ça, les logs finissent par remplir le disque.
+  // Les autres pilotes (local, journald…) gèrent déjà la leur.
+  const logOpts = (await loggingDriver()) === "json-file"
+    ? ["--log-opt", `max-size=${log_max_size}`, "--log-opt", `max-file=${log_max_files}`]
+    : [];
   const id = await dockerOk(
     [
       ...(start ? ["run", "-d"] : ["create"]),
       "--name", containerName(p.name),
       "--label", `spm.project=${p.name}`,
       "--restart", "unless-stopped",
+      ...logOpts,
+      ...(p.memory ? ["--memory", p.memory] : []),
       "-p", `${p.bind}:${p.port}:${p.internal_port}`,
       ...(existsSync(envFile) ? ["--env-file", envFile] : []),
       // -e prime sur --env-file. Valeurs passées par l'environnement, pas en argument.
@@ -195,21 +222,52 @@ async function createContainer(p: ContainerProject, start: boolean): Promise<str
   return containerId;
 }
 
+const HEALTH_TIMEOUT_MS = 30_000;
+
+type State = Awaited<ReturnType<typeof inspectState>>;
+const alive = (s: State, restartsBefore: number) => s?.state === "running" && s.restarts === restartsBefore;
+
+/** Interroge http://127.0.0.1:<port><health> jusqu'à une réponse < 400. Renvoie "" si c'est bon, sinon la raison. */
+async function waitHealthy(p: ContainerProject, restartsBefore: number): Promise<string> {
+  const url = `http://127.0.0.1:${p.port}${p.health}`;
+  const deadline = Date.now() + HEALTH_TIMEOUT_MS;
+  let last = "";
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(5000) });
+      if (res.status < 400) return "";
+      last = `HTTP ${res.status}`;
+    } catch (e) {
+      last = (e as Error).message;
+    }
+    if (!alive(await inspectState(p.name), restartsBefore)) return ""; // crash : signalé par l'appelant
+    await Bun.sleep(1000);
+  }
+  return `${url} ne répond pas correctement après ${HEALTH_TIMEOUT_MS / 1000} s (${last})`;
+}
+
 /**
  * Laisse 2 s au conteneur pour planter. Avec --restart unless-stopped, un crash apparaît comme
  * "restarting" ou comme un redémarrage de plus : dans ce cas on coupe la boucle et on renvoie les logs.
+ * Avec un chemin `health`, l'app doit en plus répondre en HTTP.
  */
 async function checkStarted(name: string, restartsBefore: number): Promise<StartResult> {
   await Bun.sleep(2000);
-  const s = await inspectState(name);
-  if (s?.state === "running" && s.restarts === restartsBefore) {
+  let s = await inspectState(name);
+  const p = getContainerProject(name);
+  let unhealthy = "";
+  if (alive(s, restartsBefore) && p.health) {
+    unhealthy = await waitHealthy(p, restartsBefore);
+    s = await inspectState(name);
+  }
+  if (alive(s, restartsBefore) && !unhealthy) {
     updateProject(name, { status: "running" });
     return { ok: true };
   }
   await docker(["stop", "-t", "1", containerName(name)]);
   const logs = await docker(["logs", "--tail", "20", containerName(name)]);
   updateProject(name, { status: "failed" });
-  return { ok: false, exitCode: s?.exitCode, logs: [logs.out, logs.err].filter(Boolean).join("\n") };
+  return { ok: false, exitCode: s?.exitCode, logs: [unhealthy, logs.out, logs.err].filter(Boolean).join("\n") };
 }
 
 /** Applique une nouvelle config (env, volumes) : recrée le conteneur, et le relance s'il tournait. */
@@ -265,6 +323,8 @@ export interface AddOptions {
   local?: boolean; // 127.0.0.1 uniquement
   env?: Record<string, string>;
   volumes?: string[];
+  memory?: string; // ex. 512m
+  health?: string; // ex. /health
 }
 
 export async function addProject(opts: AddOptions, r: Reporter): Promise<{ project: Project; start: StartResult }> {
@@ -279,8 +339,11 @@ export async function addProject(opts: AddOptions, r: Reporter): Promise<{ proje
 
   const composeFile = findComposeFile(path);
   if (composeFile) {
-    if (opts.port !== undefined || opts.internalPort !== undefined || opts.local || opts.volumes?.length || Object.keys(opts.env ?? {}).length) {
-      throw new SpmError(`${basename(composeFile)} trouvé : ports, env et volumes se règlent dans ce fichier, pas via spm`);
+    if (
+      opts.port !== undefined || opts.internalPort !== undefined || opts.local || opts.volumes?.length ||
+      Object.keys(opts.env ?? {}).length || opts.memory || opts.health
+    ) {
+      throw new SpmError(`${basename(composeFile)} trouvé : ports, env, volumes et limites se règlent dans ce fichier, pas via spm`);
     }
     return addCompose(name, path, composeFile, r);
   }
@@ -299,6 +362,8 @@ export async function addProject(opts: AddOptions, r: Reporter): Promise<{ proje
   const targets = volumes.map((v) => v.target);
   const dup = targets.find((t, i) => targets.indexOf(t) !== i);
   if (dup) throw new SpmError(`deux volumes montés sur ${dup}`);
+  const memory = opts.memory !== undefined ? parseMemory(opts.memory) : undefined;
+  const health = opts.health !== undefined ? parseHealth(opts.health) : undefined;
 
   const detected = await buildImage(name, path, r);
   const project: Project = {
@@ -309,6 +374,8 @@ export async function addProject(opts: AddOptions, r: Reporter): Promise<{ proje
     kind: detected.kind,
     env: opts.env ?? {},
     volumes,
+    ...(memory && { memory }),
+    ...(health && { health }),
     container_id: "",
     status: "stopped",
     created_at: new Date().toISOString(),
@@ -403,7 +470,16 @@ export async function redeploy(name: string, r: Reporter): Promise<{ start: Star
     if (hadImage) await docker(["rmi", previous]); // build raté : l'ancien conteneur n'a pas été touché
     throw e;
   }
+  const result = await replaceContainer(p, detected, hadImage, previous, r);
+  await pruneImages(name);
+  return result;
+}
 
+/** Remplace le conteneur par la nouvelle image ; si elle plante, relance `previous`. */
+async function replaceContainer(
+  p: ContainerProject, detected: Detected, hadImage: boolean, previous: string, r: Reporter,
+): Promise<{ start: StartResult; rolledBack: boolean }> {
+  const { name } = p;
   r.step("remplacement du conteneur");
   let start: StartResult;
   try {
@@ -475,6 +551,7 @@ export async function removeProject(name: string, opts: RemoveOptions = {}): Pro
   await docker(["rm", "-f", containerName(name)]);
   await docker(["rmi", imageName(name)]);
   await docker(["rmi", `${imageName(name)}:previous`]);
+  await pruneImages(name);
   rmSync(join(BUILDS_DIR, name), { recursive: true, force: true });
 
   // Les données ne sont jamais supprimées sans --purge.
@@ -521,7 +598,7 @@ export async function listProjects(): Promise<ProjectRow[]> {
   const rows = Object.values(reg.projects).map((p): ProjectRow => {
     const containers = containersOf(p, all);
     const status = aggregateStatus(containers);
-    if (status !== p.status) (p.status = status), (changed = true);
+    if (status !== p.status) changed = true;
     const ports = portsOf(p, containers);
     return {
       name: p.name,
@@ -532,7 +609,12 @@ export async function listProjects(): Promise<ProjectRow[]> {
       path: p.path,
     };
   });
-  if (changed) saveRegistry(reg);
+  if (changed) {
+    // Relu juste avant d'écrire : list ne prend pas le verrou et ne doit pas écraser une commande en cours.
+    const fresh = loadRegistry();
+    for (const row of rows) if (fresh.projects[row.name]) fresh.projects[row.name]!.status = row.status;
+    saveRegistry(fresh);
+  }
   return rows.sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -623,5 +705,27 @@ export async function volumeRemove(name: string, target: string, r: Reporter): P
   const t = target.replace(/(.)\/+$/, "$1");
   if (!p.volumes.some((v) => v.target === t)) throw new SpmError(`aucun volume monté sur ${t}`);
   updateProject(name, { volumes: p.volumes.filter((v) => v.target !== t) });
+  return applyConfig(name, r);
+}
+
+// ---------------------------------------------------------------- réglages
+
+const SETTINGS = { memory: parseMemory, health: parseHealth } as const;
+export type Setting = keyof typeof SETTINGS;
+export const SETTING_NAMES = Object.keys(SETTINGS) as Setting[];
+
+/** memory=512m, health=/health ; une valeur vide retire le réglage. Recrée le conteneur s'il tournait. */
+export async function setOptions(name: string, pairs: string[], r: Reporter): Promise<StartResult | null> {
+  getContainerProject(name);
+  if (!pairs.length) throw new SpmError(`aucun réglage fourni (${SETTING_NAMES.map((k) => `${k}=…`).join(", ")})`);
+  const patch: Partial<ContainerProject> = {};
+  for (const pair of pairs) {
+    const i = pair.indexOf("=");
+    const key = pair.slice(0, i) as Setting;
+    if (i < 0 || !(key in SETTINGS)) throw new SpmError(`réglage inconnu : "${pair}" (possibles : ${SETTING_NAMES.join(", ")})`);
+    const value = pair.slice(i + 1);
+    patch[key] = value ? SETTINGS[key](value) : undefined;
+  }
+  updateProject(name, patch);
   return applyConfig(name, r);
 }

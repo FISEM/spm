@@ -27,6 +27,7 @@ spm add ./blog                 # premier port libre à partir de 8100
 spm add ./api --port 8500      # port choisi
 spm add ./admin --local        # 127.0.0.1 uniquement (derrière ton propre proxy)
 spm add ./app -e API_KEY=xxx -v data:/app/data
+spm add ./api --memory 512m --health /health   # limite mémoire, vérification HTTP au déploiement
 
 spm redeploy blog              # rebuild + remplace ; port, env et volumes conservés
 spm list
@@ -36,6 +37,9 @@ spm status blog
 spm remove blog                # les données des volumes sont conservées
 spm remove blog --purge        # … sauf avec --purge
 ```
+
+Une seule commande qui modifie l'état tourne à la fois (`spm list`, `status` et `logs` restent libres) :
+une deuxième est refusée avec le nom de celle en cours.
 
 ### Docker Compose
 
@@ -55,8 +59,20 @@ spm remove stack --purge       # docker compose down -v (supprime aussi les volu
 ### Redéploiement
 
 `spm redeploy` rebuild depuis le dossier du projet pendant que l'ancien conteneur tourne encore.
-Si le build échoue, rien n'est touché. Si la nouvelle version plante au démarrage, spm relance
-automatiquement la version précédente.
+Si le build échoue, rien n'est touché. Si la nouvelle version plante au démarrage (ou, avec `--health`,
+si ce chemin ne répond pas en moins de 400 dans les 30 s), spm relance automatiquement la version précédente.
+Les anciennes images du projet sont ensuite supprimées.
+
+Le service est coupé quelques secondes pendant le remplacement (l'ancien et le nouveau conteneur ne
+peuvent pas écouter le même port en même temps).
+
+### Limites et vérification
+
+```sh
+spm set blog memory=512m               # limite mémoire (le conteneur est tué s'il la dépasse, puis relancé)
+spm set blog health=/health            # le déploiement n'est réussi que si GET /health répond < 400
+spm set blog memory= health=           # retire les deux
+```
 
 ### Variables d'environnement
 
@@ -98,8 +114,12 @@ Les Dockerfiles générés vivent dans `~/.spm/builds/<nom>/` : le dossier du pr
 `~/.spm/config.json` (optionnel, `SPM_HOME` pour changer de dossier) :
 
 ```json
-{ "port_min": 8100, "port_max": 8999, "caddyfile": "/etc/caddy/Caddyfile" }
+{ "port_min": 8100, "port_max": 8999, "caddyfile": "/etc/caddy/Caddyfile", "log_max_size": "10m", "log_max_files": 3 }
 ```
+
+Les logs de chaque conteneur tournent (3 fichiers de 10 Mo par défaut) quand Docker utilise le pilote `json-file`,
+celui par défaut, qui sinon les garde sans limite. Appliqué à la création du conteneur : les projets existants
+en profitent au prochain `redeploy`, `env set` ou `set`.
 
 Les ports déjà publiés par d'autres conteneurs (compose compris) sont évités.
 
@@ -109,7 +129,10 @@ Les ports déjà publiés par d'autres conteneurs (compose compris) sont évité
 
 ```sh
 bun install
-bun run release    # dist/spm-linux-x64, dist/spm-linux-arm64
+bun test           # tests unitaires
+bun run typecheck
+bun run release    # dist/spm-linux-x64, dist/spm-linux-arm64, dist/SHA256SUMS
 ```
 
-Publie `install.sh` et les deux binaires à la racine de `https://tondomaine.com/`.
+Publie `install.sh`, les deux binaires et `dist/SHA256SUMS` à la racine de `https://tondomaine.com/` :
+`install.sh` refuse un binaire dont l'empreinte ne correspond pas.

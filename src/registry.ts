@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -6,6 +6,7 @@ export const SPM_HOME = process.env.SPM_HOME ?? join(homedir(), ".spm");
 export const REGISTRY_PATH = join(SPM_HOME, "registry.json");
 export const CONFIG_PATH = join(SPM_HOME, "config.json");
 export const BUILDS_DIR = join(SPM_HOME, "builds");
+const LOCK_PATH = join(SPM_HOME, "lock");
 
 export class SpmError extends Error {}
 
@@ -33,6 +34,8 @@ export interface ContainerProject extends BaseProject {
   kind: string;
   env: Record<string, string>;
   volumes: Volume[];
+  memory?: string; // limite mémoire Docker (ex. 512m) ; absente = aucune limite
+  health?: string; // chemin HTTP vérifié au démarrage (ex. /health) ; absent = conteneur vivant suffit
   container_id: string;
 }
 
@@ -55,9 +58,13 @@ export interface Config {
   port_min: number;
   port_max: number;
   caddyfile: string; // lu (jamais modifié) pour afficher les domaines de chaque projet
+  log_max_size: string; // rotation des logs de chaque conteneur (pilote json-file)
+  log_max_files: number;
 }
 
-const DEFAULT_CONFIG: Config = { port_min: 8100, port_max: 8999, caddyfile: "/etc/caddy/Caddyfile" };
+const DEFAULT_CONFIG: Config = {
+  port_min: 8100, port_max: 8999, caddyfile: "/etc/caddy/Caddyfile", log_max_size: "10m", log_max_files: 3,
+};
 
 function readJson<T>(path: string, fallback: T): T {
   if (!existsSync(path)) return fallback;
@@ -110,4 +117,42 @@ export function updateProject(name: string, patch: Partial<ContainerProject> | P
   const p = getProject(reg, name);
   reg.projects[name] = { ...p, ...patch } as Project;
   saveRegistry(reg);
+}
+
+const isAlive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM"; // existe, mais à un autre utilisateur
+  }
+};
+
+/**
+ * Une seule commande qui modifie l'état à la fois : sans ça, deux commandes simultanées
+ * s'écrasent le registre. Libéré à la sortie ; un verrou dont le processus est mort est repris.
+ */
+export function acquireLock(command: string) {
+  mkdirSync(SPM_HOME, { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(LOCK_PATH, `${process.pid} ${command}\n`, { flag: "wx", mode: 0o600 });
+      process.on("exit", () => rmSync(LOCK_PATH, { force: true }));
+      return;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    }
+    let owner: string;
+    try {
+      owner = readFileSync(LOCK_PATH, "utf8");
+    } catch {
+      continue; // libéré entre-temps
+    }
+    const [pid, ...cmd] = owner.trim().split(" ");
+    if (isAlive(Number(pid))) {
+      throw new SpmError(`une autre commande spm est en cours (spm ${cmd.join(" ")}, pid ${pid}) : réessaie quand elle aura fini`);
+    }
+    rmSync(LOCK_PATH, { force: true }); // commande tuée sans libérer son verrou
+  }
+  throw new SpmError(`impossible de prendre le verrou ${LOCK_PATH}`);
 }

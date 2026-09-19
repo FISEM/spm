@@ -41,6 +41,14 @@ export async function dockerOk(args: string[], stream = false, env?: Record<stri
   return r.out;
 }
 
+let logDriver: Promise<string> | undefined;
+
+/** Pilote de logs par défaut du démon (json-file, local, journald…), lu une fois par commande. */
+export function loggingDriver(): Promise<string> {
+  logDriver ??= docker(["info", "--format", "{{.LoggingDriver}}"]).then((r) => r.out);
+  return logDriver;
+}
+
 export function toStatus(dockerState: string | undefined): Status {
   if (!dockerState) return "missing";
   if (dockerState === "running") return "running";
@@ -77,7 +85,7 @@ export async function allContainers(): Promise<ContainerInfo[]> {
 }
 
 /** "127.0.0.1:8001->8000/tcp, 0.0.0.0:8002->3000/tcp, [::]:8002->3000/tcp" → ["127.0.0.1:8001", "8002"] */
-function parsePorts(raw: string): string[] {
+export function parsePorts(raw: string): string[] {
   const seen = new Set<string>();
   for (const part of raw.split(",")) {
     const host = part.trim().split("->")[0];
