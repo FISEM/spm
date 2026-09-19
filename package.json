@@ -1,0 +1,16 @@
+{
+  "name": "spm",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun src/spm.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build --compile --minify src/spm.ts --outfile dist/spm",
+    "release": "bun build --compile --minify --target=bun-linux-x64 src/spm.ts --outfile dist/spm-linux-x64 && bun build --compile --minify --target=bun-linux-arm64 src/spm.ts --outfile dist/spm-linux-arm64"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  }
+}
