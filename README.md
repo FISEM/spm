@@ -30,10 +30,10 @@ spm add ./app -e API_KEY=xxx -v data:/app/data
 spm add ./api --memory 512m --health /health   # limite mémoire, vérification HTTP au déploiement
 
 spm redeploy blog              # rebuild + remplace ; port, env et volumes conservés
-spm list
+spm list                       # --json : sortie lisible par un script ou une IA
 spm stop|start|restart blog
 spm logs blog -f
-spm status blog
+spm status blog                # --json aussi (noms des variables d'env, jamais leurs valeurs)
 spm remove blog                # les données des volumes sont conservées
 spm remove blog --purge        # … sauf avec --purge
 ```

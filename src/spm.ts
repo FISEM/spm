@@ -17,13 +17,13 @@ Projets :
   spm add <path> [options]          détecte, build, lance et enregistre (docker compose si présent)
   spm import <path> [--name <nom>]  enregistre un projet compose existant, sans rien relancer
   spm redeploy <nom>                rebuild et remplace (port, env et volumes conservés)
-  spm list                          tous les projets : statut, ports, domaines (lus dans Caddy)
+  spm list [--json]                 tous les projets : statut, ports, domaines (lus dans Caddy)
   spm start|stop|restart <nom>
   spm remove <nom> [--down] [--purge]
                                     compose : désenregistre seulement, sauf --down (arrête et
                                     supprime les conteneurs) ; --purge supprime aussi les volumes
   spm logs <nom> [-f] [-n <lignes>]
-  spm status <nom>
+  spm status <nom> [--json]         config, conteneurs, CPU, mémoire (--json : sans valeurs d'env)
   spm set <nom> memory=512m health=/health
                                     limite mémoire, chemin HTTP vérifié au démarrage ;
                                     une valeur vide retire le réglage (memory=)
@@ -122,8 +122,16 @@ async function importCmd(args: string[]) {
   console.log(`✓ ${project.name} importé (${status}), rien n'a été relancé`);
 }
 
-async function list() {
+const printJson = (data: unknown) => console.log(JSON.stringify(data, null, 2));
+
+async function list(args: string[]) {
   const projects = await listProjects();
+  if (args.includes("--json")) {
+    const unmanaged = (await unmanagedContainers()).map(({ name, state, ports, composeDir }) => ({
+      name, state, ports, compose_dir: composeDir || null,
+    }));
+    return printJson({ projects, unmanaged });
+  }
   if (projects.length) {
     table([
       ["NOM", "TYPE", "STATUT", "PORTS", "DOMAINES"],
@@ -177,8 +185,23 @@ async function logs(args: string[]) {
   process.exitCode = r.code;
 }
 
-async function status(name: string) {
+async function status(args: string[]) {
+  const name = args.find((a) => !a.startsWith("-"));
+  if (!name) throw new SpmError("usage : spm status <nom> [--json]");
   const { project: p, status, domains, containers } = await projectStatus(name);
+  if (args.includes("--json")) {
+    // Noms des variables seulement : leurs valeurs (secrets) ne sortent jamais du registre.
+    const config = isCompose(p)
+      ? { compose_file: p.compose_file, compose_project: p.compose_project }
+      : {
+          bind: p.bind, port: p.port, internal_port: p.internal_port, kind: p.kind,
+          memory: p.memory ?? null, health: p.health ?? null, env_keys: Object.keys(p.env), volumes: p.volumes,
+        };
+    return printJson({
+      name: p.name, mode: isCompose(p) ? "compose" : "container", status, path: p.path, domains, ...config,
+      containers: containers.map(({ name, state, exitCode, ports, stats }) => ({ name, state, exit_code: exitCode, ports, stats })),
+    });
+  }
   if (isCompose(p)) {
     console.log(`${p.name}  docker compose  (${status})`);
     console.log(`fichier   : ${p.compose_file}`);
@@ -261,11 +284,11 @@ async function main() {
     case "add": return add(rest);
     case "import": return importCmd(rest);
     case "redeploy": case "deploy": return redeployCmd(needName());
-    case "list": case "ls": return list();
+    case "list": case "ls": return list(rest);
     case "start": case "stop": case "restart": return lifecycleCmd(cmd, needName());
     case "remove": case "rm": return remove(rest);
     case "logs": return logs(rest);
-    case "status": return status(needName());
+    case "status": return status(rest);
     case "env": return env(rest);
     case "volume": case "volumes": return volume(rest);
     case "set": return set(rest);
