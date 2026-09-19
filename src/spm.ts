@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
+import pkg from "../package.json";
 import {
   addProject, describeVolume, envList, envSet, envUnset, importProject, lifecycle, listProjects, parseEnv, parsePort,
   projectStatus, redeploy, removeProject, unmanagedContainers, volumeAdd, volumeList, volumeRemove,
@@ -8,7 +9,7 @@ import {
 import { compose, containerName, docker } from "./docker";
 import { getProject, isCompose, loadRegistry, SpmError } from "./registry";
 
-const VERSION = "0.3.0";
+const VERSION = pkg.version;
 
 const HELP = `spm ${VERSION} — PaaS personnel minimaliste
 
@@ -35,7 +36,7 @@ Volumes :
   spm volume rm <nom> <cible>       démonte (les données sont conservées)
 
 Options de add :
-  --port <port>            port ouvert sur la machine (défaut : premier libre à partir de 8001)
+  --port <port>            port ouvert sur la machine (défaut : premier libre à partir de 8100)
   --name <nom>             nom du projet (défaut : nom du dossier)
   --internal-port <port>   port écouté par l'app dans le conteneur (défaut : détecté)
   --local                  n'ouvrir le port que sur 127.0.0.1
