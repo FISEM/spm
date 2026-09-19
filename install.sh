@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Installation de spm :
-#   curl -sL https://tondomaine.com/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/FISEM/spm/main/install.sh | bash
 #
-# SPM_BASE_URL : d'où télécharger le binaire (défaut : https://tondomaine.com)
+# SPM_BASE_URL : d'où télécharger le binaire (défaut : dernière release GitHub)
 set -euo pipefail
 
-BASE_URL="${SPM_BASE_URL:-https://tondomaine.com}"
+BASE_URL="${SPM_BASE_URL:-https://github.com/FISEM/spm/releases/latest/download}"
 BIN=/usr/local/bin/spm
 
 say() { printf '\033[1m→ %s\033[0m\n' "$*"; }

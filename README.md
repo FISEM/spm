@@ -15,7 +15,7 @@ La logique vit dans `src/core.ts` (fonctions qui renvoient des données, sans ri
 ## Installation
 
 ```sh
-curl -sL https://tondomaine.com/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/FISEM/spm/main/install.sh | bash
 ```
 
 Prérequis : Docker, et l'utilisateur dans le groupe `docker`.
@@ -134,5 +134,6 @@ bun run typecheck
 bun run release    # dist/spm-linux-x64, dist/spm-linux-arm64, dist/SHA256SUMS
 ```
 
-Publie `install.sh`, les deux binaires et `dist/SHA256SUMS` à la racine de `https://tondomaine.com/` :
-`install.sh` refuse un binaire dont l'empreinte ne correspond pas.
+Publication : `bun run release`, puis une release GitHub `vX.Y.Z` avec les deux binaires et `dist/SHA256SUMS`
+(`gh release create vX.Y.Z dist/spm-linux-x64 dist/spm-linux-arm64 dist/SHA256SUMS`).
+`install.sh` télécharge la dernière release et refuse un binaire dont l'empreinte ne correspond pas.
