@@ -3,7 +3,8 @@ import { parseArgs } from "node:util";
 import pkg from "../package.json";
 import {
   addProject, describeVolume, envList, envSet, envUnset, importProject, lifecycle, listProjects, parseEnv, parsePort,
-  projectStatus, redeploy, removeProject, setOptions, unmanagedContainers, volumeAdd, volumeList, volumeRemove,
+  orphanVolumes, projectStatus, projectVolumes, pruneVolumes, redeploy, removeProject, setOptions,
+  unmanagedContainers, volumeAdd, volumeList, volumeRemove,
   type Reporter, type StartResult,
 } from "./core";
 import { compose, containerName, docker } from "./docker";
@@ -34,9 +35,12 @@ Variables d'environnement :
   spm env unset <nom> CLE...        supprime, puis relance
 
 Volumes :
-  spm volume <nom>                  liste
+  spm volume <nom>                  liste les volumes Docker du projet et leur état
   spm volume add <nom> <source>:<cible>[:ro]
   spm volume rm <nom> <cible>       démonte (les données sont conservées)
+  spm volume prune <nom> --yes      supprime les volumes que plus rien n'utilise
+                                    (orphelins d'un changement de config) ; leurs
+                                    données sont perdues
 
 Options de add :
   --port <port>            port ouvert sur la machine (défaut : premier libre à partir de 8100)
@@ -241,19 +245,56 @@ async function env(args: string[]) {
   throw new SpmError("usage : spm env <nom> | spm env set <nom> CLE=valeur... | spm env unset <nom> CLE...");
 }
 
+/** Volumes Docker du projet : ce qui sert encore, et ce qui traîne. */
+async function volumeState(name: string) {
+  const volumes = await projectVolumes(name);
+  if (!volumes.length) return console.log(`aucun volume Docker pour ${name}`);
+  table([
+    ["VOLUME", "ÉTAT"],
+    ...volumes.map((v) => [v.name, v.used ? "utilisé" : v.declared ? "déclaré, non monté" : "orphelin"]),
+  ]);
+  const orphelins = orphanVolumes(volumes);
+  if (orphelins.length) {
+    console.log(`\n${orphelins.length} orphelin(s) : plus aucun conteneur ni config ne les utilise.`);
+    console.log(`  spm volume prune ${name} --yes    (les données qu'ils contiennent seront perdues)`);
+  }
+}
+
+async function volumePrune(name: string, confirme: boolean) {
+  const orphelins = orphanVolumes(await projectVolumes(name));
+  if (!orphelins.length) return console.log(`aucun volume orphelin pour ${name}`);
+  if (!confirme) {
+    console.log(`${orphelins.length} volume(s) seraient supprimés, avec leurs données :`);
+    for (const v of orphelins) console.log(`  ${v.name}`);
+    throw new SpmError(`relance avec --yes pour confirmer : spm volume prune ${name} --yes`);
+  }
+  const { removed, failed } = await pruneVolumes(name);
+  for (const v of removed) console.log(`✓ ${v} supprimé`);
+  for (const v of failed) console.error(`✗ ${v} n'a pas pu être supprimé (utilisé par un conteneur ?)`);
+  if (failed.length) process.exitCode = 1;
+}
+
 async function volume(args: string[]) {
   const [sub, name, arg] = args;
+  if (sub === "prune" && name) return volumePrune(name, args.includes("--yes"));
   if (sub === "add" && name && arg) return report(name, await volumeAdd(name, arg, cli), `volume monté pour ${name}`);
   if ((sub === "rm" || sub === "remove") && name && arg) {
     return report(name, await volumeRemove(name, arg, cli), `volume démonté pour ${name} (données conservées)`);
   }
-  if (sub && !name && !["add", "rm", "remove"].includes(sub)) {
+  if (sub && !name && !["add", "rm", "remove", "prune"].includes(sub)) {
+    // Projet compose : sa config n'appartient pas à spm, on montre l'état réel côté Docker.
+    const p = getProject(loadRegistry(), sub);
+    if (isCompose(p)) return volumeState(sub);
     const vols = volumeList(sub);
-    if (!vols.length) return console.log(`aucun volume pour ${sub} (spm volume add ${sub} data:/app/data)`);
-    for (const v of vols) console.log(describeVolume(sub, v));
-    return;
+    if (vols.length) for (const v of vols) console.log(describeVolume(sub, v));
+    else console.log(`aucun volume déclaré pour ${sub} (spm volume add ${sub} data:/app/data)`);
+    console.log();
+    return volumeState(sub);
   }
-  throw new SpmError("usage : spm volume <nom> | spm volume add <nom> <source>:<cible>[:ro] | spm volume rm <nom> <cible>");
+  throw new SpmError(
+    "usage : spm volume <nom> | spm volume add <nom> <source>:<cible>[:ro] | " +
+    "spm volume rm <nom> <cible> | spm volume prune <nom> --yes",
+  );
 }
 
 async function set(args: string[]) {
@@ -267,7 +308,7 @@ async function set(args: string[]) {
 /** Commandes qui modifient l'état : une seule à la fois (les listes et les logs restent libres). */
 function mutates(cmd: string | undefined, rest: string[]): boolean {
   if (cmd === "env") return rest[0] === "set" || rest[0] === "unset";
-  if (cmd === "volume" || cmd === "volumes") return ["add", "rm", "remove"].includes(rest[0] ?? "");
+  if (cmd === "volume" || cmd === "volumes") return ["add", "rm", "remove", "prune"].includes(rest[0] ?? "");
   return ["add", "import", "redeploy", "deploy", "start", "stop", "restart", "remove", "rm", "set"].includes(cmd ?? "");
 }
 

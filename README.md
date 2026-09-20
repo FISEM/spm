@@ -88,12 +88,20 @@ dans `~/.spm/registry.json` (mode 600) et priment sur le `.env` du projet.
 ### Volumes
 
 ```sh
-spm volume blog                        # liste
+spm volume blog                        # volumes Docker du projet et leur état
 spm volume add blog data:/app/data     # volume Docker nommé (spm-blog-data)
 spm volume add blog ./uploads:/app/uploads     # dossier de l'hôte, relatif au projet
 spm volume add blog /etc/ssl/certs:/certs:ro   # lecture seule
 spm volume rm blog /app/data           # démonte, les données restent
+spm volume prune blog --yes            # supprime les volumes orphelins (données perdues)
 ```
+
+Un volume devient **orphelin** quand plus aucun conteneur ne le monte et qu'aucune
+config ne le déclare — typiquement après un changement d'architecture, par exemple
+en passant de SQLite à PostgreSQL. Plus rien ne le suit, il occupe le disque en
+silence. `spm volume <nom>` les signale, y compris pour les projets Docker Compose,
+dont spm ne gère pourtant pas la configuration. La suppression exige `--yes` :
+les données du volume sont perdues.
 
 | Détecté | Image | Port interne |
 |---|---|---|

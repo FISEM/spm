@@ -8,8 +8,9 @@ import { basename, join, resolve } from "node:path";
 import { caddyDomains } from "./caddy";
 import { detect, GENERATED_DOCKERIGNORE, SECRETS_DOCKERIGNORE, type Detected } from "./detect";
 import {
-  allContainers, compose, composeOk, containerName, docker, dockerOk, imageName, inspectState, loggingDriver, toStatus,
-  type ContainerInfo,
+  allContainers, allVolumes, compose, composeOk, containerName, docker, dockerOk, imageName, inspectState,
+  loggingDriver, mountedVolumes, toStatus,
+  type ContainerInfo, type VolumeInfo,
 } from "./docker";
 import {
   BUILDS_DIR, getProject, isCompose, loadConfig, loadRegistry, saveRegistry, SpmError, updateProject,
@@ -728,4 +729,63 @@ export async function setOptions(name: string, pairs: string[], r: Reporter): Pr
   }
   updateProject(name, patch);
   return applyConfig(name, r);
+}
+
+// ---------------------------------------------------------------- volumes Docker
+
+export interface ProjectVolume {
+  name: string;
+  used: boolean; // monté par un conteneur, même arrêté
+  declared: boolean; // encore décrit par la config du projet
+}
+
+/**
+ * Les volumes Docker qui appartiennent à un projet.
+ *
+ * Compose les étiquette (`com.docker.compose.project`) ; spm nomme les siens
+ * `spm-<projet>-<source>`. Un volume retiré du docker-compose.yml garde son
+ * étiquette : c'est ainsi qu'on retrouve les orphelins d'un changement
+ * d'architecture, que plus aucun outil ne suivrait autrement.
+ */
+export function belongsToProject(v: VolumeInfo, p: Project): boolean {
+  return isCompose(p)
+    ? v.composeProject === p.compose_project
+    : v.spmProject === p.name || v.name.startsWith(`spm-${p.name}-`);
+}
+
+export async function projectVolumes(name: string): Promise<ProjectVolume[]> {
+  const p = getProject(loadRegistry(), name);
+  const [volumes, montes] = await Promise.all([allVolumes(), mountedVolumes()]);
+  const declares = new Set(
+    isCompose(p) ? [] : p.volumes.filter(isNamedVolume).map((v) => dockerVolumeName(p.name, v)),
+  );
+  return volumes
+    .filter((v) => belongsToProject(v, p))
+    .map((v) => ({
+      name: v.name,
+      used: montes.has(v.name),
+      // En compose, la config vit dans le fichier : un volume monté est, de fait, déclaré.
+      declared: isCompose(p) ? montes.has(v.name) : declares.has(v.name),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Volumes du projet que plus rien n'utilise : candidats à la suppression. */
+export const orphanVolumes = (volumes: ProjectVolume[]): ProjectVolume[] =>
+  volumes.filter((v) => !v.used && !v.declared);
+
+/**
+ * Supprime les volumes orphelins du projet. Les données qu'ils contiennent
+ * sont perdues : l'appelant doit avoir obtenu un accord explicite.
+ */
+export async function pruneVolumes(name: string): Promise<{ removed: string[]; failed: string[] }> {
+  const orphelins = orphanVolumes(await projectVolumes(name));
+  const removed: string[] = [];
+  const failed: string[] = [];
+  for (const v of orphelins) {
+    // Docker refuse de supprimer un volume utilisé : dernière sécurité si un
+    // conteneur est apparu entre la liste et la suppression.
+    ((await docker(["volume", "rm", v.name])).code === 0 ? removed : failed).push(v.name);
+  }
+  return { removed, failed };
 }

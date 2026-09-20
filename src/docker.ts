@@ -97,6 +97,39 @@ export function parsePorts(raw: string): string[] {
   return [...seen];
 }
 
+export interface VolumeInfo {
+  name: string;
+  composeProject: string; // label com.docker.compose.project
+  spmProject: string; // label spm.project, pour les volumes créés par spm
+}
+
+/** Tous les volumes Docker de la machine, avec leurs labels de projet. */
+export async function allVolumes(): Promise<VolumeInfo[]> {
+  const out = await dockerOk([
+    "volume", "ls", "--format",
+    '{{.Name}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "spm.project"}}',
+  ]);
+  return out.split("\n").filter(Boolean).map((line) => {
+    const [name, composeProject, spmProject] = line.split("\t");
+    return { name: name!, composeProject: composeProject ?? "", spmProject: spmProject ?? "" };
+  });
+}
+
+/**
+ * Noms des volumes montés par un conteneur, arrêté ou non.
+ *
+ * Via `docker inspect`, et surtout pas `docker ps --format {{.Mounts}}` : ce
+ * dernier tronque les noms longs ("kira_kira_uplo…"), et un nom tronqué ne
+ * correspond à rien — un volume bien vivant passerait alors pour orphelin.
+ */
+export async function mountedVolumes(): Promise<Set<string>> {
+  const ids = (await dockerOk(["ps", "-aq"])).split("\n").filter(Boolean);
+  if (!ids.length) return new Set();
+  // .Name est vide pour un montage de dossier hôte : seuls les volumes nommés comptent.
+  const out = await dockerOk(["inspect", "--format", "{{range .Mounts}}{{.Name}}\n{{end}}", ...ids]);
+  return new Set(out.split("\n").map((n) => n.trim()).filter(Boolean));
+}
+
 export function compose(p: ComposeProject, args: string[], stream = false) {
   return docker(["compose", "-f", p.compose_file, "-p", p.compose_project, ...args], stream);
 }

@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { parseEnv, parseHealth, parseMemory, parsePort, parseVolume } from "../src/core";
+import {
+  belongsToProject, orphanVolumes, parseEnv, parseHealth, parseMemory, parsePort, parseVolume,
+} from "../src/core";
 import { parsePorts } from "../src/docker";
 
 describe("parsePort", () => {
@@ -49,4 +51,30 @@ describe("parsePorts", () => {
     ]);
   });
   test("vide", () => expect(parsePorts("")).toEqual([]));
+});
+
+describe("volumes d'un projet", () => {
+  const compose = { name: "kira", mode: "compose", compose_project: "kira" } as never;
+  const conteneur = { name: "blog", mode: "container", volumes: [] } as never;
+  const vol = (name: string, composeProject = "", spmProject = "") => ({ name, composeProject, spmProject });
+
+  test("compose : reconnu par l'étiquette, même retiré du fichier", () => {
+    expect(belongsToProject(vol("kira_kira_data", "kira"), compose)).toBe(true);
+    expect(belongsToProject(vol("budget_data", "budget"), compose)).toBe(false);
+  });
+
+  test("projet spm : reconnu par le préfixe ou l'étiquette", () => {
+    expect(belongsToProject(vol("spm-blog-data"), conteneur)).toBe(true);
+    expect(belongsToProject(vol("autre", "", "blog"), conteneur)).toBe(true);
+    expect(belongsToProject(vol("spm-blogue-data"), conteneur)).toBe(false); // préfixe complet exigé
+  });
+
+  test("orphelin = ni monté, ni déclaré", () => {
+    const volumes = [
+      { name: "utilise", used: true, declared: true },
+      { name: "declare-arrete", used: false, declared: true },
+      { name: "orphelin", used: false, declared: false },
+    ];
+    expect(orphanVolumes(volumes).map((v) => v.name)).toEqual(["orphelin"]);
+  });
 });
