@@ -84,13 +84,39 @@ spm set blog memory= health=           # retire les deux
 ### Variables d'environnement
 
 ```sh
-spm env blog                           # liste
+spm env blog                           # les noms et leur date, jamais les valeurs
+spm env reveal blog                    # les valeurs
 spm env set blog DATABASE_URL=... DEBUG=0
 spm env unset blog DEBUG
+spm env import blog                    # reprend le .env existant du projet
 ```
 
-Chaque modification recrée le conteneur (et le relance s'il tournait). Les variables sont stockées
-dans `~/.spm/registry.json` (mode 600) et priment sur le `.env` du projet.
+Les valeurs sont chiffrées (AES-256-GCM) dans `~/.spm/secrets.json`, avec la clé maîtresse
+`~/.spm/master.key` (mode 600 tous les deux). Les noms et les dates de modification restent en
+clair : savoir *qu'*un projet possède une clé modifiée le 12 mars n'est pas un secret, c'est
+l'inventaire qu'on veut consulter d'un coup d'œil.
+
+**La clé maîtresse doit être sauvegardée avec le coffre.** Sans elle, `secrets.json` ne vaut rien.
+Le format ne dépend pas de spm — `iv:tag:chiffré` en base64, la clé étant les 32 octets en base64
+de `master.key` — donc les valeurs restent récupérables sans le binaire.
+
+**Projet conteneur :** chaque modification recrée le conteneur et le relance s'il tournait.
+
+**Projet compose :** spm écrit le `.env` du projet juste avant le déploiement, puis s'efface — le
+coffre n'est jamais une dépendance de démarrage. Le fichier est **fusionné, pas remplacé** : une
+variable présente dans le `.env` mais absente du coffre est conservée, et une copie de l'original
+est gardée dans `.env.avant-spm` la première fois.
+
+### Panneau web
+
+```sh
+spm serve                              # http://127.0.0.1:8140, jeton dans ~/.spm/panneau.token
+spm serve --port 9000 --public         # toutes les interfaces : à placer derrière Caddy
+```
+
+L'inventaire du coffre, avec les variables partagées par plusieurs projets mises en évidence —
+c'est ce qui casse un service le jour d'une rotation, quand une seule des deux copies est mise à
+jour. Le panneau n'affiche **jamais** une valeur : pour ça il faut être sur la machine.
 
 ### Volumes
 
