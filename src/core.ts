@@ -16,6 +16,9 @@ import {
   BUILDS_DIR, getProject, isCompose, loadConfig, loadRegistry, saveRegistry, SpmError, updateProject,
   type ComposeProject, type ContainerProject, type Project, type Status, type Volume,
 } from "./registry";
+import {
+  definir, fusionnerDotEnv, inventaire, lireDotEnv, supprimer, valeurs,
+} from "./secrets";
 
 export interface Reporter {
   step(message: string): void;
@@ -395,6 +398,11 @@ async function composeImages(p: ComposeProject): Promise<{ image: string; secour
  * décision, à prendre en connaissance de cause.
  */
 async function redeployCompose(p: ComposeProject, r: Reporter): Promise<{ start: StartResult; rolledBack: boolean }> {
+  // Avant tout le reste : le `.env` que docker compose lira. C'est le seul
+  // moment où le coffre intervient — ensuite spm s'efface, et les conteneurs
+  // tournent sans dépendre de lui.
+  ecrireEnvDepuisLeCoffre(p, r);
+
   const images = await composeImages(p);
 
   // 1. Filet de sécurité : les images en service deviennent les images de secours.
@@ -785,24 +793,104 @@ export async function projectStatus(name: string): Promise<ProjectStatus> {
 
 // ---------------------------------------------------------------- env
 
-export function envList(name: string): Record<string, string> {
-  return getContainerProject(name).env;
+/**
+ * Les variables vivent dans le coffre (`~/.spm/secrets.json`, chiffré), pour
+ * tous les projets — conteneur comme compose.
+ *
+ * Avant, `spm env` refusait les projets compose en renvoyant l'utilisateur vers
+ * son `docker-compose.yml`, ce qui était exact et inutile : le compose lit un
+ * `.env` que personne ne gérait. Désormais spm écrit ce `.env` au déploiement.
+ *
+ * Les projets conteneur déjà enregistrés gardent leurs variables dans le
+ * registre : elles sont reversées dans le coffre à la première lecture, pour
+ * qu'une installation existante n'ait rien à faire.
+ */
+function migrerDepuisLeRegistre(name: string) {
+  const p = getProject(loadRegistry(), name);
+  if (isCompose(p) || !Object.keys(p.env).length) return;
+  if (inventaire(name).length) return; // déjà migré
+  definir(name, p.env);
+}
+
+export function envList(name: string): { cle: string; modifie: string }[] {
+  getProject(loadRegistry(), name);
+  migrerDepuisLeRegistre(name);
+  return inventaire(name);
+}
+
+export function envReveal(name: string): Record<string, string> {
+  getProject(loadRegistry(), name);
+  migrerDepuisLeRegistre(name);
+  return valeurs(name);
 }
 
 export async function envSet(name: string, vars: Record<string, string>, r: Reporter): Promise<StartResult | null> {
-  const p = getContainerProject(name);
+  const p = getProject(loadRegistry(), name);
   if (!Object.keys(vars).length) throw new SpmError("aucune variable fournie (CLE=valeur)");
+  migrerDepuisLeRegistre(name);
+  definir(name, vars);
+  // Un projet compose relit son `.env` au prochain déploiement : on ne
+  // redémarre rien ici, pour ne pas couper un service sur un `env set`.
+  if (isCompose(p)) {
+    r.step(`${Object.keys(vars).length} variable(s) enregistrée(s) — actives au prochain spm redeploy ${name}`);
+    return null;
+  }
   updateProject(name, { env: { ...p.env, ...vars } });
   return applyConfig(name, r);
 }
 
 export async function envUnset(name: string, keys: string[], r: Reporter): Promise<StartResult | null> {
-  const env = { ...getContainerProject(name).env };
-  const unknown = keys.filter((k) => !(k in env));
-  if (unknown.length) throw new SpmError(`variable(s) inconnue(s) : ${unknown.join(", ")}`);
+  const p = getProject(loadRegistry(), name);
+  migrerDepuisLeRegistre(name);
+  const connues = new Set(inventaire(name).map((v) => v.cle));
+  const inconnues = keys.filter((k) => !connues.has(k));
+  if (inconnues.length) throw new SpmError(`variable(s) inconnue(s) : ${inconnues.join(", ")}`);
+  supprimer(name, keys);
+  if (isCompose(p)) {
+    r.step(`${keys.length} variable(s) retirée(s) du coffre — le .env sera nettoyé au prochain redeploy`);
+    return null;
+  }
+  const env = { ...p.env };
   for (const k of keys) delete env[k];
   updateProject(name, { env });
   return applyConfig(name, r);
+}
+
+/** Avale un `.env` existant : c'est la porte d'entrée pour un projet déjà en place. */
+export function envImport(name: string, r: Reporter): number {
+  const p = getProject(loadRegistry(), name);
+  const fichier = join(p.path, ".env");
+  if (!existsSync(fichier)) throw new SpmError(`pas de .env dans ${p.path}`);
+  const vars = lireDotEnv(readFileSync(fichier, "utf8"));
+  if (!Object.keys(vars).length) throw new SpmError(`${fichier} ne contient aucune variable lisible`);
+  definir(name, vars);
+  r.step(`${Object.keys(vars).length} variable(s) reprises depuis ${fichier}`);
+  return Object.keys(vars).length;
+}
+
+/**
+ * Écrit le `.env` du projet depuis le coffre, juste avant un déploiement.
+ *
+ * Fusion et non remplacement : un `.env` peut contenir des variables que le
+ * coffre ne connaît pas encore, et les écraser effacerait des secrets que
+ * personne n'a ailleurs. Une copie de l'original est gardée la première fois.
+ */
+export function ecrireEnvDepuisLeCoffre(p: Project, r: Reporter) {
+  const duCoffre = valeurs(p.name);
+  if (!Object.keys(duCoffre).length) return;
+
+  const fichier = join(p.path, ".env");
+  const existant = existsSync(fichier) ? readFileSync(fichier, "utf8") : "";
+  const sauvegarde = `${fichier}.avant-spm`;
+  if (existant && !existsSync(sauvegarde)) {
+    writeFileSync(sauvegarde, existant, { mode: 0o600 });
+    r.step(`copie de l'ancien .env dans ${sauvegarde}`);
+  }
+
+  const fusionne = fusionnerDotEnv(existant, duCoffre);
+  if (fusionne === existant) return;
+  writeFileSync(fichier, fusionne, { mode: 0o600 });
+  r.step(`.env écrit depuis le coffre (${Object.keys(duCoffre).length} variable(s))`);
 }
 
 // ---------------------------------------------------------------- volumes

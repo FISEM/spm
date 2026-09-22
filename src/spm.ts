@@ -2,12 +2,13 @@
 import { parseArgs } from "node:util";
 import pkg from "../package.json";
 import {
-  addProject, describeVolume, envList, envSet, envUnset, importProject, lifecycle, listProjects, parseEnv, parsePort,
+  addProject, describeVolume, envImport, envList, envReveal, envSet, envUnset, importProject, lifecycle, listProjects, parseEnv, parsePort,
   orphanVolumes, projectStatus, projectVolumes, pruneVolumes, redeploy, removeProject, setOptions,
   unmanagedContainers, volumeAdd, volumeList, volumeRemove,
   type Reporter, type StartResult,
 } from "./core";
 import { compose, containerName, docker } from "./docker";
+import { PORT_PAR_DEFAUT, servir } from "./panneau";
 import { acquireLock, getProject, isCompose, loadRegistry, SpmError } from "./registry";
 
 const VERSION = pkg.version;
@@ -29,10 +30,18 @@ Projets :
                                     limite mémoire, chemin HTTP vérifié au démarrage ;
                                     une valeur vide retire le réglage (memory=)
 
-Variables d'environnement :
-  spm env <nom>                     liste
-  spm env set <nom> CLE=valeur...   ajoute ou modifie, puis relance
-  spm env unset <nom> CLE...        supprime, puis relance
+Variables d'environnement (coffre chiffré dans ~/.spm) :
+  spm env <nom>                     liste les noms et leur date, sans les valeurs
+  spm env reveal <nom>              affiche les valeurs
+  spm env set <nom> CLE=valeur...   ajoute ou modifie
+  spm env unset <nom> CLE...        supprime
+  spm env import <nom>              reprend le .env existant du projet
+                                    compose : le .env est réécrit au prochain redeploy
+
+Panneau web du coffre :
+  spm serve [--port 8140] [--public]
+                                    inventaire des variables (jamais les valeurs),
+                                    sur 127.0.0.1, protégé par un jeton
 
 Volumes :
   spm volume <nom>                  liste les volumes Docker du projet et leur état
@@ -124,6 +133,20 @@ async function importCmd(args: string[]) {
   if (!positionals[0]) throw new SpmError("usage : spm import <path> [--name <nom>]");
   const { project, status } = await importProject(positionals[0], values.name);
   console.log(`✓ ${project.name} importé (${status}), rien n'a été relancé`);
+}
+
+function serve(args: string[]) {
+  const { values } = parseArgs({
+    args,
+    options: { port: { type: "string" }, public: { type: "boolean" } },
+  });
+  const port = values.port ? parsePort(values.port) : PORT_PAR_DEFAUT;
+  // --public n'écoute que sur 0.0.0.0 : c'est un choix explicite, parce que
+  // Docker mis à part, rien d'autre sur cette machine n'ouvre un port au monde.
+  const { url } = servir(port, values.public ? "0.0.0.0" : "127.0.0.1");
+  console.log(`panneau du coffre : ${url}`);
+  if (values.public) console.log("⚠ écoute sur toutes les interfaces — à placer derrière Caddy, pas à exposer nu");
+  console.log("Ctrl-C pour arrêter.");
 }
 
 const printJson = (data: unknown) => console.log(JSON.stringify(data, null, 2));
@@ -236,13 +259,28 @@ async function env(args: string[]) {
   const [sub, name, ...rest] = args;
   if (sub === "set" && name) return report(name, await envSet(name, parseEnv(rest), cli), `variables mises à jour pour ${name}`);
   if (sub === "unset" && name && rest.length) return report(name, await envUnset(name, rest, cli), `variables supprimées pour ${name}`);
-  if (sub && !name && !["set", "unset"].includes(sub)) {
-    const vars = Object.entries(envList(sub));
-    if (!vars.length) return console.log(`aucune variable pour ${sub} (spm env set ${sub} CLE=valeur)`);
-    for (const [k, v] of vars) console.log(`${k}=${v}`);
+  if (sub === "import" && name) {
+    envImport(name, cli);
+    return console.log(`✓ ${name} : variables reprises dans le coffre (spm env ${name} pour les voir)`);
+  }
+  if (sub === "reveal" && name) {
+    for (const [k, v] of Object.entries(envReveal(name))) console.log(`${k}=${v}`);
     return;
   }
-  throw new SpmError("usage : spm env <nom> | spm env set <nom> CLE=valeur... | spm env unset <nom> CLE...");
+  if (sub && !name && !["set", "unset", "import", "reveal"].includes(sub)) {
+    const vars = envList(sub);
+    if (!vars.length) return console.log(`aucune variable pour ${sub} (spm env set ${sub} CLE=valeur)`);
+    // Les valeurs ne s'affichent jamais par défaut : on consulte cette liste
+    // pour savoir ce qui existe, pas pour lire un secret par-dessus l'épaule.
+    for (const { cle, modifie } of vars) {
+      console.log(`${cle.padEnd(28)} modifiée le ${modifie.slice(0, 10)}`);
+    }
+    console.log(`\n${vars.length} variable(s) — spm env reveal ${sub} pour les valeurs`);
+    return;
+  }
+  throw new SpmError(
+    "usage : spm env <nom> | spm env reveal <nom> | spm env set <nom> CLE=valeur... | spm env unset <nom> CLE... | spm env import <nom>",
+  );
 }
 
 /** Volumes Docker du projet : ce qui sert encore, et ce qui traîne. */
@@ -332,6 +370,7 @@ async function main() {
     case "status": return status(rest);
     case "env": return env(rest);
     case "volume": case "volumes": return volume(rest);
+    case "serve": return serve(rest);
     case "set": return set(rest);
     case "-v": case "--version": case "version": return console.log(VERSION);
     case undefined: case "-h": case "--help": case "help": return console.log(HELP);

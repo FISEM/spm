@@ -1,11 +1,14 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { caddyDomains } from "../src/caddy";
 
 test("domaines par port local", () => {
-  const file = join(mkdtempSync(join(tmpdir(), "spm-caddy-")), "Caddyfile");
+  // Le dossier est supprimé à la fin : sans ça, chaque `bun test` laissait un
+  // dossier derrière lui dans /tmp — on en a retrouvé 27.
+  const dir = mkdtempSync(join(tmpdir(), "spm-caddy-"));
+  const file = join(dir, "Caddyfile");
   writeFileSync(file, `{
   email moi@example.com
 }
@@ -31,6 +34,7 @@ distant.example.com {
   expect(map.get(8101)).toEqual(["api.example.com"]);
   expect(map.get(8102)).toEqual(["api.example.com"]);
   expect(map.size).toBe(3);
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("pas de Caddyfile : aucun domaine", () => expect(caddyDomains("/nulle/part/Caddyfile").size).toBe(0));
