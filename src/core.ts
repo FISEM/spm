@@ -13,7 +13,7 @@ import {
   type ContainerInfo, type VolumeInfo,
 } from "./docker";
 import {
-  BUILDS_DIR, getProject, isCompose, loadConfig, loadRegistry, saveRegistry, SpmError, updateProject,
+  BUILDS_DIR, getProject, isCompose, loadConfig, loadRegistry, saveRegistry, SPM_HOME, SpmError, updateProject,
   type ComposeProject, type ContainerProject, type Project, type Status, type Volume,
 } from "./registry";
 import {
@@ -874,15 +874,25 @@ export function envImport(name: string, r: Reporter): number {
  * Fusion et non remplacement : un `.env` peut contenir des variables que le
  * coffre ne connaît pas encore, et les écraser effacerait des secrets que
  * personne n'a ailleurs. Une copie de l'original est gardée la première fois.
+ *
+ * Cette copie va dans `~/.spm/anciens-env/`, **jamais** à côté du `.env`. La
+ * première version la déposait dans le dossier du projet, c'est-à-dire dans un
+ * arbre git : un dépôt dont le `.gitignore` ne listait que `.env` (et pas
+ * `.env.*`) se retrouvait à un `git add -A` de publier ses secrets. spm ne doit
+ * pas créer, dans le dossier de quelqu'un, un fichier qu'il ne lui a pas
+ * demandé d'ignorer.
  */
+export const ANCIENS_ENV = join(SPM_HOME, "anciens-env");
+
 export function ecrireEnvDepuisLeCoffre(p: Project, r: Reporter) {
   const duCoffre = valeurs(p.name);
   if (!Object.keys(duCoffre).length) return;
 
   const fichier = join(p.path, ".env");
   const existant = existsSync(fichier) ? readFileSync(fichier, "utf8") : "";
-  const sauvegarde = `${fichier}.avant-spm`;
+  const sauvegarde = join(ANCIENS_ENV, `${p.name}.env`);
   if (existant && !existsSync(sauvegarde)) {
+    mkdirSync(ANCIENS_ENV, { recursive: true, mode: 0o700 });
     writeFileSync(sauvegarde, existant, { mode: 0o600 });
     r.step(`copie de l'ancien .env dans ${sauvegarde}`);
   }
