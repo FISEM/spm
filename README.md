@@ -66,6 +66,13 @@ Les anciennes images du projet sont ensuite supprimées.
 Le service est coupé quelques secondes pendant le remplacement (l'ancien et le nouveau conteneur ne
 peuvent pas écouter le même port en même temps).
 
+**Projets compose.** Même principe : les images construites par le projet sont étiquetées
+`…:spm-previous` avant le build, puis `docker compose up -d` remplace les conteneurs. Si la nouvelle
+version ne démarre pas — un conteneur en échec, ou qui redémarre en boucle pendant les 12 s
+d'observation — spm remet les images de secours et relance la version précédente. Seules les images
+que le projet construit lui-même sont concernées : une base de données ou un cache tirés d'un
+registre ne sont jamais réétiquetés.
+
 ### Limites et vérification
 
 ```sh

@@ -104,6 +104,11 @@ const sanitizeName = (s: string) =>
 
 const COMPOSE_FILES = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
 
+// Durée d'observation après un déploiement compose. Assez longue pour qu'une
+// boucle de crash se manifeste (docker espace ses relances), assez courte pour
+// ne pas faire attendre un déploiement qui va bien.
+const COMPOSE_OBSERVATION_MS = 12_000;
+
 export function findComposeFile(dir: string): string | null {
   const f = COMPOSE_FILES.find((f) => existsSync(join(dir, f)));
   return f ? join(dir, f) : null;
@@ -298,11 +303,46 @@ function aggregateStatus(containers: ContainerInfo[]): Status {
 const composeContainers = async (p: ComposeProject) =>
   (await allContainers()).filter((c) => c.composeProject === p.compose_project);
 
-/** Comme checkStarted, pour tous les services d'un projet compose. On ne coupe rien : la politique de redémarrage est la sienne. */
-async function checkComposeStarted(p: ComposeProject): Promise<StartResult> {
-  await Bun.sleep(3000);
-  const containers = await composeContainers(p);
-  const status = aggregateStatus(containers);
+/** Nombre de redémarrages de chaque conteneur du projet, à un instant donné. */
+async function redemarrages(p: ComposeProject): Promise<Map<string, number>> {
+  const compte = new Map<string, number>();
+  for (const c of await composeContainers(p)) {
+    compte.set(c.name, (await inspectState(c.name))?.restarts ?? 0);
+  }
+  return compte;
+}
+
+/**
+ * Comme checkStarted, pour tous les services d'un projet compose. On ne coupe
+ * rien : la politique de redémarrage est la sienne.
+ *
+ * La surveillance dure plusieurs secondes, et pas un instantané : un conteneur
+ * qui plante au démarrage et que docker relance **oscille** entre « démarré »
+ * et « redémarrage ». Un seul coup d'œil tombait une fois sur deux sur un
+ * moment où il tournait, et spm annonçait un succès sur un service mort —
+ * constaté en provoquant la panne pour de vrai.
+ */
+async function checkComposeStarted(p: ComposeProject, avant?: Map<string, number>): Promise<StartResult> {
+  const deadline = Date.now() + COMPOSE_OBSERVATION_MS;
+  let containers = await composeContainers(p);
+  let status: Status = "missing";
+
+  while (Date.now() < deadline) {
+    await Bun.sleep(1500);
+    containers = await composeContainers(p);
+    status = aggregateStatus(containers);
+    if (status !== "running") break;
+
+    // Un conteneur qui a redémarré depuis le déploiement est en train de
+    // tomber, même s'il paraît debout à cet instant précis.
+    const maintenant = await redemarrages(p);
+    const relance = [...maintenant].find(([nom, n]) => n > (avant?.get(nom) ?? 0));
+    if (relance) {
+      status = "failed";
+      break;
+    }
+  }
+
   updateProject(p.name, { status });
   if (status === "running") return { ok: true };
   const bad = containers.filter((c) => containerStatus(c) !== "running");
@@ -311,6 +351,90 @@ async function checkComposeStarted(p: ComposeProject): Promise<StartResult> {
     ok: false,
     exitCode: bad.find((c) => c.exitCode)?.exitCode,
     logs: `services en échec : ${bad.map((c) => c.name).join(", ") || "aucun conteneur"}\n${[logs.out, logs.err].filter(Boolean).join("\n")}`,
+  };
+}
+
+/**
+ * Parmi les images déclarées par un fichier compose, celles que ce projet
+ * construit lui-même — les seules qui changent d'un déploiement à l'autre.
+ *
+ * Les images tirées d'un registre (postgres, redis, nginx) sont écartées :
+ * les étiqueter comme secours ne protégerait de rien, et remettre une ancienne
+ * image de base sur une base de données serait même dangereux.
+ *
+ * Reconnaissance par préfixe, comme docker compose nomme ce qu'il construit :
+ * `<projet>-<service>` (ou `_` sur les anciennes versions).
+ */
+export function imagesConstruites(declarees: string[], composeProject: string): { image: string; secours: string }[] {
+  return declarees
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .filter((i) => i.startsWith(`${composeProject}-`) || i.startsWith(`${composeProject}_`))
+    .map((image) => ({ image, secours: `${image.split(":")[0]}:spm-previous` }));
+}
+
+async function composeImages(p: ComposeProject): Promise<{ image: string; secours: string }[]> {
+  const { out } = await compose(p, ["config", "--images"]);
+  return imagesConstruites(out.split("\n"), p.compose_project);
+}
+
+/**
+ * Redéploie un projet compose, avec retour arrière.
+ *
+ * Ce que ça change par rapport à `docker compose up -d --build` : avant de
+ * construire, on étiquette les images en service comme images de secours. Si
+ * le nouveau code ne démarre pas, on les remet et on relance — au lieu de
+ * laisser le service mort avec rien pour revenir, ce qui était le seul défaut
+ * capable de coûter une soirée.
+ *
+ * Ce que ça ne fait **pas** : supprimer l'interruption. L'ancien conteneur est
+ * remplacé, donc le service est absent une dizaine de secondes. Servir les
+ * deux versions en parallèle demanderait un second port et une bascule dans
+ * Caddy — et surtout que chaque migration reste compatible avec la version
+ * précédente, puisque les deux parleraient à la même base. C'est une autre
+ * décision, à prendre en connaissance de cause.
+ */
+async function redeployCompose(p: ComposeProject, r: Reporter): Promise<{ start: StartResult; rolledBack: boolean }> {
+  const images = await composeImages(p);
+
+  // 1. Filet de sécurité : les images en service deviennent les images de secours.
+  const gardees: { image: string; secours: string }[] = [];
+  for (const { image, secours } of images) {
+    if ((await docker(["image", "inspect", image])).code !== 0) continue; // première construction
+    if ((await docker(["tag", image, secours])).code === 0) gardees.push({ image, secours });
+  }
+  if (gardees.length) r.step(`filet : ${gardees.length} image(s) étiquetée(s) pour un retour arrière`);
+
+  // 2. Construction pendant que l'ancienne version sert encore : c'est la
+  //    partie longue, et elle n'interrompt rien.
+  r.step("docker compose build");
+  try {
+    await composeOk(p, ["build"], r.stream);
+  } catch (e) {
+    r.step("construction échouée : le service en place n'a pas été touché");
+    throw e;
+  }
+
+  // 3. Remplacement : c'est ici, et seulement ici, que le service s'absente.
+  const avant = await redemarrages(p);
+  r.step("docker compose up -d");
+  await composeOk(p, ["up", "-d"], r.stream);
+
+  const start = await checkComposeStarted(p, avant);
+  if (start.ok || !gardees.length) return { start, rolledBack: false };
+
+  // 4. Le nouveau code ne tient pas : on remet l'ancien.
+  r.step("démarrage raté — retour à la version précédente");
+  for (const { image, secours } of gardees) await docker(["tag", secours, image]);
+  const avantRetour = await redemarrages(p);
+  await composeOk(p, ["up", "-d", "--force-recreate"], r.stream);
+  const retour = await checkComposeStarted(p, avantRetour);
+
+  return {
+    start: retour.ok
+      ? { ...start, logs: `${start.logs ?? ""}\n\nversion précédente rétablie : le service répond de nouveau`.trim() }
+      : { ...retour, logs: `${start.logs ?? ""}\n\nle retour arrière a échoué lui aussi :\n${retour.logs ?? ""}`.trim() },
+    rolledBack: true,
   };
 }
 
@@ -453,12 +577,7 @@ export async function importProject(dir: string, name?: string): Promise<{ proje
  */
 export async function redeploy(name: string, r: Reporter): Promise<{ start: StartResult; rolledBack: boolean }> {
   const found = getProject(loadRegistry(), name);
-  if (isCompose(found)) {
-    // Pas de retour arrière automatique en compose : plusieurs services, images et volumes à coordonner.
-    r.step("docker compose up -d --build");
-    await composeOk(found, ["up", "-d", "--build"], r.stream);
-    return { start: await checkComposeStarted(found), rolledBack: false };
-  }
+  if (isCompose(found)) return redeployCompose(found, r);
   const p = found;
   const previous = `${imageName(name)}:previous`;
   const hadImage = (await docker(["image", "inspect", imageName(name)])).code === 0;
