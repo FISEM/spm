@@ -10,6 +10,7 @@ import {
 import { compose, containerName, docker } from "./docker";
 import { PORT_PAR_DEFAUT, servir } from "./panneau";
 import { acquireLock, getProject, isCompose, loadRegistry, SpmError } from "./registry";
+import { passe, suivre } from "./suivi";
 
 const VERSION = pkg.version;
 
@@ -19,6 +20,12 @@ Projets :
   spm add <path> [options]          détecte, build, lance et enregistre (docker compose si présent)
   spm import <path> [--name <nom>]  enregistre un projet compose existant, sans rien relancer
   spm redeploy <nom>                rebuild et remplace (port, env et volumes conservés)
+
+Suivi d'une branche (pousser déclenche le déploiement) :
+  spm watch [<nom> [--branch <b>]]  sans nom : liste ce qui est suivi
+  spm unwatch <nom>                 cesse de suivre ; rien n'est arrêté
+  spm sync [--dry-run]              une passe : ce qui a bougé est redéployé
+                                    --dry-run : dit ce qu'il ferait, sans rien faire
   spm list [--json]                 tous les projets : statut, ports, domaines (lus dans Caddy)
   spm start|stop|restart <nom>
   spm remove <nom> [--down] [--purge]
@@ -126,6 +133,51 @@ async function redeployCmd(name: string) {
   if (start.ok) return console.log(`✓ ${name} redéployé`);
   report(name, start, "");
   console.error(rolledBack ? "↩ version précédente relancée, elle tourne toujours." : "✗ aucune version ne tourne.");
+}
+
+// --------------------------------------------------- suivi d'une branche
+
+async function watchCmd(args: string[]) {
+  const { values, positionals } = parseArgs({
+    args, allowPositionals: true, options: { branch: { type: "string" } },
+  });
+  if (!positionals[0]) {
+    const suivis = Object.values(loadRegistry().projects).filter((p) => p.suivi?.branche);
+    if (!suivis.length) return console.log("aucun projet suivi — spm watch <nom> pour en suivre un");
+    for (const p of suivis) {
+      const d = p.suivi!.dernier ? ` · dernier ${p.suivi!.dernier.slice(0, 7)} le ${(p.suivi!.le ?? "").slice(0, 10)}` : "";
+      console.log(`${p.name} → ${p.suivi!.branche}${d}`);
+    }
+    return;
+  }
+  const branche = values.branch ?? "main";
+  suivre(positionals[0], branche);
+  console.log(`✓ ${positionals[0]} suit ${branche} — « spm sync » déploiera ce qui y est poussé`);
+}
+
+async function unwatchCmd(name: string) {
+  suivre(name, null);
+  console.log(`✓ ${name} n'est plus suivi (rien n'a été arrêté)`);
+}
+
+async function syncCmd(args: string[]) {
+  const { values } = parseArgs({ args, options: { "dry-run": { type: "boolean" } } });
+  const resultats = await passe(async (nom) => {
+    const { start, rolledBack } = await redeploy(nom, cli);
+    if (start.ok) return { ok: true, detail: "" };
+    return { ok: false, detail: rolledBack
+      ? "la nouvelle version ne démarre pas — la précédente tourne toujours"
+      : "la nouvelle version ne démarre pas, et aucune ne tourne" };
+  }, values["dry-run"] === true);
+
+  if (!resultats.length) return console.log("aucun projet suivi");
+  for (const r of resultats) {
+    const marque = r.verdict === "deployer" ? "✓" : r.verdict === "a-jour" ? "·" : "✗";
+    console.log(`${marque} ${r.nom} : ${r.raison}`);
+  }
+  // Un échec doit se voir d'où qu'on appelle — y compris depuis une minuterie
+  // qui ne lit que le code de sortie.
+  if (resultats.some((r) => r.verdict === "casse")) process.exitCode = 1;
 }
 
 async function importCmd(args: string[]) {
@@ -345,9 +397,14 @@ async function set(args: string[]) {
 
 /** Commandes qui modifient l'état : une seule à la fois (les listes et les logs restent libres). */
 function mutates(cmd: string | undefined, rest: string[]): boolean {
+  if (cmd === "watch") return rest.length > 0;
   if (cmd === "env") return rest[0] === "set" || rest[0] === "unset";
   if (cmd === "volume" || cmd === "volumes") return ["add", "rm", "remove", "prune"].includes(rest[0] ?? "");
-  return ["add", "import", "redeploy", "deploy", "start", "stop", "restart", "remove", "rm", "set"].includes(cmd ?? "");
+  // `sync` et `watch` modifient : le premier déploie, le second change le
+  // registre. Sans verrou, une minuterie qui se déclenche pendant un
+  // déploiement manuel lancerait deux builds sur le même projet.
+  return ["add", "import", "redeploy", "deploy", "start", "stop", "restart", "remove", "rm", "set",
+          "sync", "watch", "unwatch"].includes(cmd ?? "");
 }
 
 async function main() {
@@ -363,6 +420,9 @@ async function main() {
     case "add": return add(rest);
     case "import": return importCmd(rest);
     case "redeploy": case "deploy": return redeployCmd(needName());
+    case "watch": return watchCmd(rest);
+    case "unwatch": return unwatchCmd(needName());
+    case "sync": return syncCmd(rest);
     case "list": case "ls": return list(rest);
     case "start": case "stop": case "restart": return lifecycleCmd(cmd, needName());
     case "remove": case "rm": return remove(rest);

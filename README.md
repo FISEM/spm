@@ -73,6 +73,40 @@ d'observation — spm remet les images de secours et relance la version précéd
 que le projet construit lui-même sont concernées : une base de données ou un cache tirés d'un
 registre ne sont jamais réétiquetés.
 
+### Suivre une branche
+
+Pousser sur la branche suivie déclenche le redéploiement, sans ouvrir de terminal.
+
+```
+spm watch mon-projet --branch main   met le projet sous suivi (main par défaut)
+spm watch                            liste ce qui est suivi, et le dernier commit déployé
+spm sync                             une passe : ce qui a bougé est redéployé
+spm sync --dry-run                   dit ce qu'il ferait, sans rien faire
+spm unwatch mon-projet               cesse de suivre ; rien n'est arrêté
+```
+
+**Scrutation, pas webhook.** Un webhook demande un port ouvert, une URL publique et un secret
+partagé — trois choses à configurer et à protéger, pour gagner quelques dizaines de secondes.
+`spm sync` interroge git et ne demande rien. Une minuterie l'appelle aussi souvent qu'on veut :
+
+```
+*/2 * * * * /usr/local/bin/spm sync >> /var/log/spm-sync.log 2>&1
+```
+
+**Ce que spm refuse de faire**, parce que le dossier d'un projet est aussi l'endroit où on l'édite :
+
+- des modifications **non commitées** dans le dossier : il ne déploie pas, et le dit. Un `git pull`
+  par-dessus perdrait du travail que personne n'a sauvegardé ailleurs ;
+- des branches **divergentes** : il ne tranche pas à votre place et ne fabrique pas de commit de
+  fusion. L'avance est directe (`--ff-only`) ou elle n'a pas lieu ;
+- un **distant injoignable** : il le signale plutôt que de conclure que tout va bien — confondre les
+  deux ferait croire au suivi de fonctionner alors qu'il ne verrait plus rien passer.
+
+Chaque passe dit ce qu'elle a fait, projet par projet, y compris « rien ». `spm sync` sort avec un
+code non nul si un déploiement a échoué, pour qu'une minuterie puisse s'en apercevoir. Le
+redéploiement lui-même garde ses garanties : build à côté, retour arrière si la nouvelle version ne
+démarre pas.
+
 ### Limites et vérification
 
 ```sh

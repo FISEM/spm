@@ -23,6 +23,12 @@ interface BaseProject {
   path: string;
   status: Status;
   created_at: string;
+  /** Branche suivie : un commit poussé dessus déclenche un redéploiement.
+   *
+   *  Absent, le projet ne se redéploie que sur demande — c'est le défaut, et
+   *  il doit le rester : un suivi qu'on n'a pas demandé redéploierait un
+   *  service en production sans que personne ne s'y attende. */
+  suivi?: { branche: string; dernier?: string; le?: string };
 }
 
 /** Projet lancé par spm : un conteneur, Dockerfile détecté ou généré. */
