@@ -862,6 +862,33 @@ export async function envSet(name: string, vars: Record<string, string>, r: Repo
   return applyConfig(name, r);
 }
 
+/**
+ * Appliquer les variables du coffre **sans reconstruire**.
+ *
+ * `envSet` range la variable et s'arrête là : couper un service parce qu'on
+ * a changé une clé serait pire que le retard. Mais attendre le prochain
+ * `redeploy` veut dire attendre un build complet — plusieurs minutes, et
+ * quelques giga-octets de cache sur une machine qui fait tourner de la
+ * production.
+ *
+ * Ici on écrit le `.env` et on recrée les conteneurs à partir des **images
+ * déjà construites**. Le code n'a pas changé, seule la configuration : il n'y
+ * a rien à recompiler. C'est ce qui rend une rotation de clé supportable
+ * depuis un téléphone.
+ */
+export async function envAppliquer(name: string, r: Reporter): Promise<StartResult | null> {
+  const p = getProject(loadRegistry(), name);
+  ecrireEnvDepuisLeCoffre(p, r);
+  if (!isCompose(p)) return applyConfig(name, r);
+  // `--force-recreate` et pas un simple `up -d` : quand seul le `.env` a
+  // changé, compose considère le conteneur à jour et ne le remplace pas — la
+  // nouvelle valeur n'arriverait jamais dans le processus.
+  const avant = await redemarrages(p);
+  await composeOk(p, ["up", "-d", "--force-recreate"], r.stream);
+  r.step("conteneurs recréés avec la nouvelle configuration");
+  return checkComposeStarted(p, avant);
+}
+
 export async function envUnset(name: string, keys: string[], r: Reporter): Promise<StartResult | null> {
   const p = getProject(loadRegistry(), name);
   migrerDepuisLeRegistre(name);
