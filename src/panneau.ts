@@ -40,6 +40,24 @@ import { envAppliquer, quiet } from "./core";
 export const TOKEN_PATH = join(SPM_HOME, "panneau.token");
 export const PORT_PAR_DEFAUT = 8140;
 
+/**
+ * Remplacer le jeton.
+ *
+ * Le nouveau est affiché **une fois**, dans la page qui suit — c'est la seule
+ * valeur que ce panneau montre jamais. Sans ça, régénérer reviendrait à se
+ * verrouiller dehors sur tous ses autres appareils.
+ *
+ * L'ancien cesse de marcher immédiatement : le serveur relit le fichier à
+ * chaque requête plutôt que de garder la valeur en mémoire. C'est tout
+ * l'intérêt — un jeton qu'on croit révoqué et qui continue d'ouvrir la porte
+ * est pire qu'un jeton qu'on n'a pas changé.
+ */
+export function regenererJeton(): string {
+  const neuf = randomBytes(24).toString("base64url");
+  writeFileSync(TOKEN_PATH, neuf + "\n", { mode: 0o600 });
+  return neuf;
+}
+
 export function jeton(): string {
   if (!existsSync(TOKEN_PATH)) {
     writeFileSync(TOKEN_PATH, randomBytes(24).toString("base64url") + "\n", { mode: 0o600 });
@@ -230,7 +248,9 @@ function page(v: VueDuCoffre): string {
   .ajout summary { cursor: pointer; color: #939aa8; font-size: 13px; padding: 4px 0; }
   .appliquer { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
   .appliquer .aide { color: #6f7684; font-size: 12px; }
-  .avis { border-radius: 8px; padding: 12px 16px; margin: 16px 0; }
+  .danger { background: #6e2b2b !important; }
+  .danger:hover { background: #853434 !important; }
+  .avis { border-radius: 8px; word-break: break-all; padding: 12px 16px; margin: 16px 0; }
   .avis.ok { background: #13291f; border: 1px solid #245c3e; }
   .avis.raté { background: #2a1616; border: 1px solid #5c2424; }
   footer { margin-top: 40px; color: #6f7684; font-size: 13px; border-top: 1px solid #23262d; padding-top: 16px; }
@@ -242,7 +262,15 @@ function page(v: VueDuCoffre): string {
   ${v.avis ? `<div class="avis ${v.avis.ok ? "ok" : "raté"}">${echapper(v.avis.texte)}</div>` : ""}
   ${alerte}
   ${projets || "<p>Le coffre est vide. <code>spm env import &lt;projet&gt;</code> pour reprendre un .env existant.</p>"}
-  <footer>Pour lire une valeur : <code>spm env reveal &lt;projet&gt;</code>, sur la machine.</footer>
+  <footer>
+    <p>Pour lire une valeur : <code>spm env reveal &lt;projet&gt;</code>, sur la machine.</p>
+    <form method="post" action="/jeton" class="appliquer"
+          onsubmit="return confirm('Le jeton actuel cessera de marcher partout, y compris sur tes autres appareils. Continuer ?')">
+      <input type="hidden" name="jeton" value="${echapper(v.jeton)}">
+      <button type="submit" class="danger">Régénérer le jeton d'accès</button>
+      <span class="aide">l'ancien cesse de marcher immédiatement</span>
+    </form>
+  </footer>
 </body>
 </html>`;
 }
@@ -301,12 +329,15 @@ function reponseApres(avis: { ok: boolean; texte: string }, jetonDuPanneau: stri
 }
 
 export function servir(port = PORT_PAR_DEFAUT, hote = "127.0.0.1") {
-  const attendu = jeton();
+  // Créé maintenant s'il n'existe pas ; relu à chaque requête ensuite, pour
+  // qu'une régénération prenne effet sans redémarrer le service.
+  jeton();
 
   const serveur = Bun.serve({
     port,
     hostname: hote,
     async fetch(requete) {
+      const attendu = jeton();
       const url = new URL(requete.url);
       const fourni = url.searchParams.get("jeton")
         ?? requete.headers.get("authorization")?.replace(/^Bearer\s+/i, "")
@@ -321,6 +352,21 @@ export function servir(port = PORT_PAR_DEFAUT, hote = "127.0.0.1") {
         const jetonDuFormulaire = String(corps.get("jeton") ?? "");
         if (!jetonValide(jetonDuFormulaire, attendu)) {
           return new Response("jeton invalide\n", { status: 403 });
+        }
+        // Le seul cas où la réponse change de jeton : on repose le cookie,
+        // sinon l'onglet qui vient de régénérer se retrouverait dehors.
+        if (url.pathname === "/jeton") {
+          const neuf = regenererJeton();
+          return new Response(page(vue(neuf, {
+            ok: true,
+            texte: `Nouveau jeton — note-le maintenant, il ne sera plus affiché : ${neuf}`,
+          })), {
+            headers: {
+              "content-type": "text/html; charset=utf-8",
+              "set-cookie": poserCookie(neuf, securise(requete)),
+              ...ENTETES,
+            },
+          });
         }
         return reponseApres(await agir(url.pathname, corps), attendu);
       }
@@ -352,5 +398,6 @@ export function servir(port = PORT_PAR_DEFAUT, hote = "127.0.0.1") {
     },
   });
 
-  return { serveur, url: `http://${hote}:${port}/?jeton=${attendu}` };
+  // Relu ici aussi : le jeton peut avoir été régénéré depuis le démarrage.
+  return { serveur, url: `http://${hote}:${port}/?jeton=${jeton()}` };
 }

@@ -143,3 +143,38 @@ describe("la vue", () => {
     expect(vue().jeton).toBe("");
   });
 });
+
+describe("régénérer le jeton", () => {
+  it("refuse sans le jeton actuel", async () => {
+    const avant = jeton();
+    const r = await poster("/jeton", {});
+    expect(r.status).toBe(403);
+    expect(jeton()).toBe(avant);
+  });
+
+  it("en pose un nouveau, l'affiche une fois, et invalide l'ancien", async () => {
+    const ancien = jeton();
+    const r = await poster("/jeton", { jeton: ancien });
+    expect(r.status).toBe(200);
+
+    const neuf = jeton();
+    expect(neuf).not.toBe(ancien);
+
+    // Affiché une fois — sinon régénérer reviendrait à se verrouiller dehors.
+    const html = await r.text();
+    expect(html).toContain(neuf);
+    // Et reposé en cookie, pour que l'onglet qui vient de cliquer reste dedans.
+    expect(r.headers.get("set-cookie") ?? "").toContain(encodeURIComponent(neuf));
+
+    // L'ancien ne doit plus rien ouvrir, sans redémarrer le service.
+    const avecAncien = await fetch(`http://127.0.0.1:${PORT}/`, {
+      headers: { cookie: `spm_panneau=${ancien}` },
+    });
+    expect(avecAncien.status).toBe(401);
+
+    const avecNeuf = await fetch(`http://127.0.0.1:${PORT}/`, {
+      headers: { cookie: `spm_panneau=${neuf}` },
+    });
+    expect(avecNeuf.status).toBe(200);
+  });
+});
