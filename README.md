@@ -71,7 +71,9 @@ peuvent pas écouter le même port en même temps).
 version ne démarre pas — un conteneur en échec, ou qui redémarre en boucle pendant les 12 s
 d'observation — spm remet les images de secours et relance la version précédente. Seules les images
 que le projet construit lui-même sont concernées : une base de données ou un cache tirés d'un
-registre ne sont jamais réétiquetés.
+registre ne sont jamais réétiquetés. **Une fois le démarrage confirmé, le filet est retiré** — sinon
+chaque redéploiement laisserait un jeu d'images de plus, pour toujours. Après un retour arrière il
+est conservé : ce sont ces images-là qui font tourner le service.
 
 ### Suivre une branche
 

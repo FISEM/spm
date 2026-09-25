@@ -382,6 +382,23 @@ async function composeImages(p: ComposeProject): Promise<{ image: string; secour
 }
 
 /**
+ * Les images de secours à supprimer après un redéploiement compose.
+ *
+ * **La règle qui n'est pas évidente : on ne jette qu'en cas de succès.** Après
+ * un retour arrière, ce sont ces images-là qui font tourner le service — les
+ * supprimer couperait ce qu'on vient de sauver.
+ *
+ * Le chemin des projets conteneur retirait déjà son filet (`rmi previous`) ;
+ * celui-ci l'oubliait. Et comme `spm add` bascule en mode compose dès qu'il
+ * trouve un fichier compose, c'est la route que prennent presque tous les
+ * projets : chaque redéploiement laissait un jeu d'images de plus, pour
+ * toujours.
+ */
+export function secoursAJeter(gardees: { secours: string }[], reussi: boolean): string[] {
+  return reussi ? gardees.map((g) => g.secours) : [];
+}
+
+/**
  * Redéploie un projet compose, avec retour arrière.
  *
  * Ce que ça change par rapport à `docker compose up -d --build` : avant de
@@ -429,6 +446,12 @@ async function redeployCompose(p: ComposeProject, r: Reporter): Promise<{ start:
   await composeOk(p, ["up", "-d"], r.stream);
 
   const start = await checkComposeStarted(p, avant);
+
+  // 4. Le filet n'a plus de raison d'être : on le retire.
+  const aJeter = secoursAJeter(gardees, start.ok);
+  for (const secours of aJeter) await docker(["rmi", secours]);
+  if (aJeter.length) r.step(`filet retiré : ${aJeter.length} image(s) de secours supprimée(s)`);
+
   if (start.ok || !gardees.length) return { start, rolledBack: false };
 
   // 4. Le nouveau code ne tient pas : on remet l'ancien.

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { imagesConstruites } from "../src/core";
+import { secoursAJeter, imagesConstruites } from "../src/core";
 
 describe("images à protéger avant un redéploiement", () => {
   test("ne garde que ce que le projet construit", () => {
@@ -28,5 +28,28 @@ describe("images à protéger avant un redéploiement", () => {
     // « kiravideos-web » ne doit pas passer pour une image du projet « kira » :
     // on remettrait alors une image de secours sur le mauvais service.
     expect(imagesConstruites(["kiravideos-web"], "kira")).toEqual([]);
+  });
+});
+
+describe("le filet d'un redéploiement compose", () => {
+  const gardees = [{ image: "odiflo-web", secours: "odiflo-web:spm-previous" },
+                   { image: "odiflo-api", secours: "odiflo-api:spm-previous" }];
+
+  test("après un démarrage réussi, le filet se retire", () => {
+    // Le chemin des projets conteneur le faisait déjà ; celui-ci l'oubliait,
+    // et c'est la route que prennent presque tous les projets. Chaque
+    // redéploiement laissait un jeu d'images de plus, pour toujours.
+    expect(secoursAJeter(gardees, true))
+      .toEqual(["odiflo-web:spm-previous", "odiflo-api:spm-previous"]);
+  });
+
+  test("après un retour arrière, on n'y touche pas", () => {
+    // Ce sont ces images-là qui font tourner le service : les supprimer
+    // couperait ce qu'on vient de sauver.
+    expect(secoursAJeter(gardees, false)).toEqual([]);
+  });
+
+  test("sans filet, il n'y a rien à retirer", () => {
+    expect(secoursAJeter([], true)).toEqual([]);
   });
 });
