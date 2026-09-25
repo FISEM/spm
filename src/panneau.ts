@@ -72,7 +72,9 @@ function cookie(requete: Request, nom: string): string | null {
  *  cookie d'être posé du tout, et le panneau redemanderait le jeton sans fin. */
 function securise(requete: Request): boolean {
   const proto = requete.headers.get("x-forwarded-proto");
-  return proto ? proto.split(",")[0].trim() === "https" : new URL(requete.url).protocol === "https:";
+  // `split` peut rendre un tableau vide selon la configuration de TypeScript :
+  // on ne suppose pas qu'il y a un premier élément.
+  return proto ? (proto.split(",")[0] ?? "").trim() === "https" : new URL(requete.url).protocol === "https:";
 }
 
 function poserCookie(valeur: string, https: boolean): string {

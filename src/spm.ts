@@ -2,7 +2,7 @@
 import { parseArgs } from "node:util";
 import pkg from "../package.json";
 import {
-  addProject, describeVolume, envImport, envList, envReveal, envSet, envUnset, importProject, lifecycle, listProjects, parseEnv, parsePort,
+  addProject, describeVolume, envAppliquer, envImport, envList, envReveal, envSet, envUnset, importProject, lifecycle, listProjects, parseEnv, parsePort,
   orphanVolumes, projectStatus, projectVolumes, pruneVolumes, redeploy, removeProject, setOptions,
   unmanagedContainers, volumeAdd, volumeList, volumeRemove,
   type Reporter, type StartResult,
@@ -311,6 +311,9 @@ async function env(args: string[]) {
   const [sub, name, ...rest] = args;
   if (sub === "set" && name) return report(name, await envSet(name, parseEnv(rest), cli), `variables mises à jour pour ${name}`);
   if (sub === "unset" && name && rest.length) return report(name, await envUnset(name, rest, cli), `variables supprimées pour ${name}`);
+  // Écrire le .env et recréer les conteneurs, sans reconstruire : changer une
+  // clé ne doit pas coûter un build complet.
+  if (sub === "appliquer" && name) return report(name, await envAppliquer(name, cli), `configuration appliquée à ${name}`);
   if (sub === "import" && name) {
     envImport(name, cli);
     return console.log(`✓ ${name} : variables reprises dans le coffre (spm env ${name} pour les voir)`);
@@ -319,7 +322,7 @@ async function env(args: string[]) {
     for (const [k, v] of Object.entries(envReveal(name))) console.log(`${k}=${v}`);
     return;
   }
-  if (sub && !name && !["set", "unset", "import", "reveal"].includes(sub)) {
+  if (sub && !name && !["set", "unset", "import", "reveal", "appliquer"].includes(sub)) {
     const vars = envList(sub);
     if (!vars.length) return console.log(`aucune variable pour ${sub} (spm env set ${sub} CLE=valeur)`);
     // Les valeurs ne s'affichent jamais par défaut : on consulte cette liste
@@ -331,7 +334,7 @@ async function env(args: string[]) {
     return;
   }
   throw new SpmError(
-    "usage : spm env <nom> | spm env reveal <nom> | spm env set <nom> CLE=valeur... | spm env unset <nom> CLE... | spm env import <nom>",
+    "usage : spm env <nom> | spm env reveal <nom> | spm env set <nom> CLE=valeur... | spm env unset <nom> CLE... | spm env appliquer <nom> | spm env import <nom>",
   );
 }
 
@@ -398,7 +401,7 @@ async function set(args: string[]) {
 /** Commandes qui modifient l'état : une seule à la fois (les listes et les logs restent libres). */
 function mutates(cmd: string | undefined, rest: string[]): boolean {
   if (cmd === "watch") return rest.length > 0;
-  if (cmd === "env") return rest[0] === "set" || rest[0] === "unset";
+  if (cmd === "env") return ["set", "unset", "appliquer"].includes(rest[0] ?? "");
   if (cmd === "volume" || cmd === "volumes") return ["add", "rm", "remove", "prune"].includes(rest[0] ?? "");
   // `sync` et `watch` modifient : le premier déploie, le second change le
   // registre. Sans verrou, une minuterie qui se déclenche pendant un
